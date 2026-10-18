@@ -6,6 +6,6 @@ toolchain go1.27.2
 
 require (
 	github.com/lib/pq v1.12.3
-	github.com/oekit/concurrency v0.13.1
+	github.com/oekit/concurrency v0.16.0
 	github.com/oekit/logx v0.7.0
 )
