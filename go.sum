@@ -1,6 +1,6 @@
 github.com/lib/pq v1.12.3 h1:tTWxr2YLKwIvK90ZXEw8GP7UFHtcbTtty8zsI+YjrfQ=
 github.com/lib/pq v1.12.3/go.mod h1:/p+8NSbOcwzAEI7wiMXFlgydTwcgTr3OSKMsD2BitpA=
-github.com/oekit/concurrency v0.6.0 h1:1occbWdXZyr/v3Xzh/mfFpqK8Y0BZYh4DNTeOP8WSK0=
-github.com/oekit/concurrency v0.6.0/go.mod h1:K5wV2UwkfvYUQFOawBCmaE29AGhWTGs3hsKu2vvKw4Y=
+github.com/oekit/concurrency v0.9.0 h1:Lhaw9aLexxKZuyxlZ/FCjaLhtmrYCIlqxD84VKNHjDk=
+github.com/oekit/concurrency v0.9.0/go.mod h1:K5wV2UwkfvYUQFOawBCmaE29AGhWTGs3hsKu2vvKw4Y=
 github.com/oekit/logx v0.5.1 h1:JBEGxs2Kqt1waoHd9c+yFHRQNirdgPQ96wvC6DjlzkI=
 github.com/oekit/logx v0.5.1/go.mod h1:x3wn+/0aYDrcs7EavWWAz8qUbwtysTB/gvuLZxtl2B0=
