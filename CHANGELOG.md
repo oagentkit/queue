@@ -8,8 +8,6 @@
 
 Co-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 
-- 文档(changelog)：补 CHANGELOG.md（从 git 历史生成）
-
 ## [v0.6.0] — 2026-10-19
 
 - 杂务(deps)：依赖地板对齐远端最新（concurrency v0.17.1 / logx v0.7.1） (#13)
