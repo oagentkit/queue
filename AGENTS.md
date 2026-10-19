@@ -27,7 +27,9 @@ worker/  pglease/
 - **`LeaseStore` 必须保证「同一时刻至多一个 leader」。** 这是选主的全部意义。
   实现里的条件 UPSERT 不能退化成「先查后写」—— 那是竞态，不是选主。
 - 租约续期失败/进程失联后，其他实例**必须**能在租约过期后接管。
-  拿不到租约时**静默退出或让出**，`OnStoppedLeading` 回调要真的执行清理。
+  拿不到租约时**静默退出或让出**，`LeaderElector` 的 `WithOnLost` 回调要真的执行清理。
+  ⚠️ 回调在 `LeaderElector` 的选项上（`WithOnGained` / `WithOnLost`），
+  **不在 `LeaseStore` 接口上**——`LeaseStore` 只有 `TryAcquire` 与 `Release` 两个方法。
 - 选主相关状态必须有 `-race` 回归测试兜底。
 
 ### 错误处理

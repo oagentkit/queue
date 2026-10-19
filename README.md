@@ -21,11 +21,27 @@ go get github.com/oagentkit/queue
 ## 选主契约
 
 ```go
-type LeaseStore interface { /* 条件 UPSERT 拿租约，OnStartedLeading/OnStoppedLeading 回调 */ }
+type LeaseStore interface {
+    // TryAcquire 原子获取或续约租约。key 空闲/已过期/持有者就是 holder →
+    // 置 holder 并顺延 ttl，返回 true；他人持有未过期 → 返回 false。
+    TryAcquire(ctx context.Context, key, holder string, ttl time.Duration) (bool, error)
+    // Release 释放租约（仅持有者本人生效；优雅停机让位）。
+    // 非持有者或 key 不存在 → no-op 返回 nil。
+    Release(ctx context.Context, key, holder string) error
+}
 ```
 
 实现方需保证：**同一时刻至多一个 leader**。租约续期失败或进程失联后，
 其他实例可在租约过期后接管。
+
+选主回调不在存储接口上，而在 `LeaderElector` 的选项里：
+
+```go
+NewLeaderElector(store, key, holder, ttl, interval,
+    worker.WithOnGained(func() { /* 首次当选与失而复得均触发 */ }),
+    worker.WithOnLost(func()  { /* 续约失败触发；Stop 主动让位不触发 */ }),
+)
+```
 
 ## 开发
 
