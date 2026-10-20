@@ -2,15 +2,19 @@
 
 > 本文件由 `matrix-tools/scripts/gen_changelogs.py` 从 git 历史生成，按 tag 切段、取每段内的 conventional commit 渲染。
 
+## [v0.6.2] — 2026-10-20
+
+- [round-1] fix(go): Go 地板降到 go 1.24.0，CI go-version 同步到 1.24 (#6)
+
 ## [v0.6.1] — 2026-10-20
 
-### 修复(docs)：LeaseStore 契约写成真实方法集，选主回调归位 LeaderElector 选项
+### 修复(docs)：LeaseStore 契约写成真实方法集，选主回调归位 LeaderElector 选项 (#3)
 
 Co-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 
 ## [v0.6.0] — 2026-10-19
 
-- 杂务(deps)：依赖地板对齐远端最新（concurrency v0.17.1 / logx v0.7.1）
+- 杂务(deps)：依赖地板对齐远端最新（concurrency v0.17.1 / logx v0.7.1） (#13)
 
 ## [v0.5.0] — 2026-10-19
 
@@ -32,7 +36,7 @@ AGENTS.md 立了选主正确性红线：LeaseStore 必须保证至多一个 lead
 条件 UPSERT 不得退化成「先查后写」的竞态。
 门禁：go build / go vet / go test -race 2 包全绿，gofmt 干净。
 
-- 杂务(deps)：oekit 依赖升级
+- 杂务(deps)：oekit 依赖升级 (#1)
 - 杂务(deps)：oekit/concurrency v0.12.0 -> v0.13.1
 - 杂务(deps)：oekit 三模块升至最新（pkg v0.13.0 / concurrency v0.12.0 / logx v0.7.0）
 - 杂务(deps)：oekit/concurrency v0.6.0 -> v0.9.0
