@@ -22,4 +22,4 @@ jobs:
     name: Lint & Test
     uses: oagentkit/.github/.github/workflows/go-ci.yml@main
     with:
-      go-version: '1.26'
+      go-version: '1.24'
