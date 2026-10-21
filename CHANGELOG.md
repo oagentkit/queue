@@ -2,6 +2,59 @@
 
 > 本文件由 `matrix-tools/scripts/gen_changelogs.py` 从 git 历史生成，按 tag 切段、取每段内的 conventional commit 渲染。
 
+## [v0.6.3] — 2026-10-21
+
+- 杂务(deps)：依赖地板追平上游本轮新版本——oekit/concurrency v0.19.0
+
+## 下游要做什么
+**`go mod tidy`**。地板抬高对下游是隐式 breaking：不跑就报
+`updates to go.mod needed`，且报错不提真正原因（**不是本仓的 API 变了**）。
+本仓**自身代码零改动**——只看本仓的 diff 看不出这是一次地板抬高。
+## 抬了哪几块、为什么无行为差异
+**`github.com/oekit/concurrency` v0.18.0 → v0.19.0**
+上游 diff 只动了 2 个包：
+- `retry`：**抖动 panic 修复**——`rand.Int63n` 的契约是 n > 0，而「退避幅度为 0」
+  是生产可达路径（cfg.Delay=0 / DelayHint 返回 0 / float64→int64 溢出成负数），
+  旧实现在这些路径上直接 panic。改为钳到 [0, MaxInt64]。
+- `syncx`：新增全局在飞闸门原语（`Gate`）+ 说明同步。
+**`breaker` 与 `async` 两个包一字未动。**
+**本仓实际 import 的 `oekit/concurrency` 子包：async **
+与上游改动相交的：**（无）**
+## 门禁
+```
+go build / vet / test -race   ✅
+gofmt -l .                    ✅ 空
+```
+
+- 杂务(deps)：oekit 依赖地板抬到 v0.18.0
+
+oekit 姊妹矩阵的依赖地板对齐到最新：
+- github.com/oekit/pkg        v0.17.0 → v0.18.0
+- github.com/oekit/concurrency v0.17.1 → v0.18.0
+- github.com/oekit/logx       已是最新 v0.7.1，不动
+oekit v0.18.0 的两个发布都是**纯增量**，无破坏性变更：
+- pkg：jsonrepair 补抽数组原语 ExtractArray；
+- concurrency：新增 `DoValue[T]`（带返回值的重试），`Do` 改为委托给它——
+  退避序列、抖动、MaxDelay 封顶、DelayHint 优先、Retryable 门控、ctx 取消
+  **只有一份实现**（此前这类调用方只能自己重写一遍退避，且常丢掉 DelayHint 语义）。
+依据 oagentkit/matrix-tools#44 的还债流程：依赖地板对齐到发版时刻的最新。
+本仓本轮不发 tag（不在发版集内），地板在 main 上就位，下次发版自然带上。
+
+
+- 文档(AGENTS)：补「发版顺序」小节，指向 org CONTRIBUTING 单一副本
+
+13 个业务仓的 AGENTS.md 此前对发版顺序零覆盖（只有 textx 有个
+「### 版本与发版」标题，但里面只讲 SemVer 与 module 路径），
+发版顺序只写在 org 规则仓的 .github/CONTRIBUTING.md 里，单仓读者看不到。
+本次只加**指针 + 本仓相关提醒**，runbook 本体保持**单一副本**
+（CONTRIBUTING §发版），避免 13 份副本各自漂移。
+覆盖四条：
+- CHANGELOG.md 由 matrix-tools/scripts/gen_changelogs.py 从 git 历史生成，不要手改
+- tag 必须落在 CHANGELOG 提交之后（下游 go get 拿到的是 tag 快照）
+- 警告：无参重生成会吞掉待发版段，--next-version 是唯一能产出待发版段的开关
+- 本仓相关提醒（见正文）
+
+
 ## [v0.6.2] — 2026-10-20
 
 ### 修复(go)：Go 地板降到 go 1.24.0，CI go-version 同步到 1.24
