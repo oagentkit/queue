@@ -2,7 +2,7 @@
 
 > DB 即队列 + Lease 选主，2 个包：`worker` `pglease`
 > module：`github.com/oagentkit/queue` · org：[oagentkit = Open Agent Kit](https://github.com/oagentkit)
-> 矩阵分层：**tier 0（基础层）**
+> 矩阵分层：**tier 2**（集成层，依赖 tier0/tier1 + 重第三方地板）
 
 ## 本仓包含
 
@@ -17,7 +17,7 @@ worker/  pglease/
 
 ### 分层与依赖
 
-- 依赖严格自底向上，**禁止反向依赖**。本仓是 tier 0，任何矩阵内模块都不得被本仓依赖。
+- 依赖严格自底向上，**禁止反向依赖**。本仓是 tier 2，只允许依赖 tier ≤ 2 的仓。
 - 外部依赖：`github.com/oekit/concurrency`（async）、`github.com/oekit/logx`。
 - **`github.com/lib/pq` 是测试依赖**（`pglease` 的 DSN 门控集成测试驱动），
   **生产代码禁止 import**。仓内零生产依赖是刻意设计，不要引入。
@@ -66,7 +66,7 @@ tag 必须落在 CHANGELOG 提交**之后** —— 下游 `go get` 拿到的是 
 `--next-version` 是唯一能产出待发版段的开关。**预写之后、打 tag 之前，
 不要跑无参重生成。**
 
-本仓是 tier 0 基础层，全矩阵都依赖它 —— tag 快照里的 CHANGELOG 残缺会直接传导到所有下游。
+本仓是 tier 2 集成层（带 `github.com/lib/pq` 驱动地板），矩阵内暂无仓依赖它 —— 但对外发布的仍是 tag 快照，CHANGELOG 残缺一样会留给直接取用本仓的下游。
 
 ## 明确不属于本仓的
 
