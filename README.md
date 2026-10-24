@@ -1,6 +1,6 @@
 # queue
 
-DB 即队列 + Lease 选主 —— oagentkit 模块矩阵 **tier 0**（基础层）。
+DB 即队列 + Lease 选主 —— oagentkit 模块矩阵 **tier 2**（集成层，依赖 tier0/tier1 + 重第三方地板）。
 
 ```
 go get github.com/oagentkit/queue
@@ -13,7 +13,7 @@ go get github.com/oagentkit/queue
 
 ## 定位
 
-**tier 0**，零矩阵内依赖 —— 队列与选主的存储契约在此定义，实现方按需提供。
+**tier 2**，零矩阵内依赖 —— 队列与选主的存储契约在此定义，实现方按需提供。
 
 `pglease` 的集成测试是 **DSN 门控** 的（形如 `postgres://…`），
 仓内零生产依赖：不设 DSN 时集成测试自动跳过。
