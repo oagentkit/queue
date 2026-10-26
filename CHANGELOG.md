@@ -2,6 +2,58 @@
 
 > 本文件由 `matrix-tools/scripts/gen_changelogs.py` 从 git 历史生成，按 tag 切段、取每段内的 conventional commit 渲染。
 
+## [v0.6.4] — 2026-10-26
+
+### 修复(worker)：task_panic 日志补全栈——panic 值单行常不足以定位
+
+下游实弹案例:任务体内一处 nil map 赋值,日志只有「assignment to entry in
+nil map」一行,调用方排查被迫临时 defer recover+debug.Stack 二次复现才拿到
+位置。debug.Stack 成本仅发生在 panic 路径,零热路径开销。
+
+- 文档(queue)：刷正 README.md 的层位声明——tier 0 → tier 2
+
+## 现状
+本仓 `README.md` 的两处层位声明写的是**层位重定位之前**的旧层位（tier 0），
+而矩阵单一数据源 `matrix-tools/modules.json` 说本仓是 **tier 2（集成层）**。
+层位重定位的依据见 matrix-tools 提交 `6d800c4`「层位 = 依赖地板」——
+tier 2 的定义是「依赖 tier0/tier1 + 重第三方地板」（`modules.json` 的 `tiers` 映射）。
+| 位置 | 改前 | 改后 |
+|---|---|---|
+| `README.md` 第 3 行（定位声明行） | `**tier 0**` | `**tier 2**` |
+| `README.md` 第 16 行（`## 定位` 自述行） | `**tier 0**` | `**tier 2**` |
+- `modules.json`：`queue` 的 `tier` = **2**，`tiers["2"]` = 集成层
+- 本仓 `AGENTS.md` 第 5 行：**已是** `> 矩阵分层：**tier 2**（集成层，依赖 tier0/tier1 + 重第三方地板）`
+  ⇒ 改之前，本仓的**两个第一入口互相矛盾**（`AGENTS.md` 说 tier 2、`README.md` 说 tier 0）
+## 影响
+`README.md` 是仓级的第一入口（人读 + agent 读）。它写 tier 0 而数据源是 tier 2 ⇒
+读者按 README 判断依赖方向就会算错，而分层是矩阵的**硬不变量**（tier N 不得依赖 tier > N）。
+## 改动
+**只改层位数字与层名，其余段落逐字不动**：
+- 第 3 行：`**tier 0**` → `**tier 2**`，层名 `（能力层，依赖 tier0）` → `（集成层，依赖 tier0/tier1 + 重第三方地板）`
+- `## 定位`：`**tier 0**` → `**tier 2**`，层名 `能力层` → `集成层`
+「零矩阵内依赖」这句是**真**的（`modules.json` 里 `queue.dependsOn` 为空、`go.mod` 里也没有任何矩阵内仓），保留不动，只改层位数字；那一行本来就没有层名，不硬加。
+层名与整段括号说明对齐到 tier 2 的权威表述后，与本仓 `AGENTS.md`
+及 `llm` / `toolgate` / `tools` / `agent` 四个 tier 2 仓的 README 逐字一致。
+diff 只含层位行，`README.md` 的手写段落逐字未动。
+## 验收
+- [x] `python3 matrix-tools/scripts/verify_repo_tiers.py --root .` ⇒ 本仓 README **红 0**（本地实跑，26 处声明全一致）
+- [x] 层位数字与层名与 `modules.json` 一致，且与本仓 `AGENTS.md` 一致
+- [x] **纯 .md 改动** ⇒ 不需要 CHANGELOG 条目、不打 tag、不发版（无发版步骤）
+关联 oagentkit/matrix-tools#123
+
+- 文档(queue)：刷正 AGENTS.md 层位声明——tier 0 → tier 2
+
+AGENTS.md 的层位声明与矩阵单一数据源 modules.json 不一致。
+- 矩阵分层：**tier 0（基础层）** → **tier 2**（集成层，依赖 tier0/tier1 + 重第三方地板）
+- 「本仓是 tier 0，任何矩阵内模块都不得被本仓依赖」→ tier 2 的依赖方向表述
+- 发版顺序一节里「本仓是 tier 0 基础层，全矩阵都依赖它」→ 按 tier 2 改写
+  （本仓带 github.com/lib/pq 驱动地板，矩阵内暂无仓依赖它）
+modules.json 里 queue 的 tier = 2（层名「集成层」，出自 tiers 映射）。
+层位写错会让人按 tier 0 的口径判依赖方向，而分层是矩阵的硬不变量。
+属 matrix-tools#109 的仓级层位漂移；同批修 obs / skillkit / mcpkit / rag。
+diff 只含层位行，AGENTS.md 的手写段落逐字未动。
+
+
 ## [v0.6.3] — 2026-10-21
 
 - 杂务(deps)：依赖地板追平上游本轮新版本——oekit/concurrency v0.19.0
