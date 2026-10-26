@@ -6,6 +6,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -264,8 +265,11 @@ func (p *Pool) claim(ctx context.Context) (taskID string, ok bool, err error) {
 func (p *Pool) runTask(runCtx context.Context, id int, taskID string) {
 	defer func() {
 		if r := recover(); r != nil {
+			// 补全栈：panic 值本身往往不足以定位（下游实弹案例——任务体内
+			// 一处 nil map 赋值,只有「assignment to entry in nil map」一行,
+			// 排查被迫在调用方临时 defer recover+debug.Stack 二次复现）
 			p.logger().Error("agentkit.worker.task_panic", "worker", id, "task", taskID,
-				"panic", fmt.Sprint(r))
+				"panic", fmt.Sprint(r), "stack", string(debug.Stack()))
 		}
 	}()
 	if err := p.Run(runCtx, taskID); err != nil {
