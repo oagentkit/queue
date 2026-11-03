@@ -5,12 +5,13 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"runtime/debug"
 	"sync"
 	"time"
 
 	"github.com/oekit/concurrency/async"
+	"github.com/oekit/concurrency/loop"
 	"github.com/oekit/logx"
 )
 
@@ -94,7 +95,10 @@ func (p *Pool) Start(ctx context.Context) {
 	var wg sync.WaitGroup
 	for i := 0; i < p.N; i++ {
 		wg.Add(1)
-		async.GoSafe(func() {
+		// worker 循环体 panic = 该 worker 死亡、池静默减员——panic 汇报收编
+		// 进组件 logger（与 claim_failed/task_panic 同一观测面；旧 async.GoSafe
+		// 走全局兜底，组件视角不可见）
+		p.panicRunner("agentkit.worker.loop_panic").GoSafe(func() {
 			defer wg.Done()
 			p.loop(p.loopCtx, p.runCtx, i)
 		})
@@ -103,37 +107,30 @@ func (p *Pool) Start(ctx context.Context) {
 		wg.Wait()
 		close(p.done)
 	})
+	// 心跳循环收编 concurrency/loop（ctx 感知 + 忙时丢 tick + 单轮 panic 收编
+	// + 停机排水）；FirstDelay 对齐旧 ticker 节拍（首跑在首个 interval 后）。
 	// 心跳独立等待：Stop 在任务排空后才停心跳（在途任务的心跳不能先死），
 	// 故不与 worker 同 wg——done 关闭不依赖心跳退出
+	hbLoop := loop.Run(p.hbCtx, loop.Config{
+		Interval:   HeartbeatInterval,
+		FirstDelay: HeartbeatInterval,
+		Name:       "agentkit.worker.heartbeat",
+	}, func(ctx context.Context) {
+		// 两个调用各自限时，互不挤占；并行跑——原先串行时 resetStale 慢
+		// 会把心跳挤出周期，本实例任务被对端误判过期。探测 goroutine 与
+		// claim/run 同等 panic 隔离（探测死一个不能打死本实例全部心跳）
+		var probeWg sync.WaitGroup
+		probeWg.Add(2)
+		async.GoSafe(func() { defer probeWg.Done(); p.heartbeat() })
+		async.GoSafe(func() { defer probeWg.Done(); p.resetStale() })
+		probeWg.Wait()
+	})
 	async.GoWithContext(p.hbCtx, func(ctx context.Context) {
 		defer close(p.hbDone)
-		p.heartbeatLoop(ctx)
+		hbLoop.Wait() // 停机排水：在飞轮次跑完
 	})
 	p.mu.Unlock()
 	p.logger().Info("agentkit.worker.started", "workers", p.N)
-}
-
-func (p *Pool) heartbeatLoop(ctx context.Context) {
-	ticker := time.NewTicker(HeartbeatInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			// 两个调用各自限时，互不挤占；并行跑——原先串行时 resetStale 慢
-			// 会把心跳挤出周期，本实例任务被对端误判过期。
-			// 心跳 goroutine panic = 本实例全部在途任务心跳停止 → 90s 后被
-			// 对端复位重跑（静默双跑），故与 claim/run 同等隔离
-			var wg sync.WaitGroup
-			wg.Add(2)
-			// 心跳探测 goroutine 与 claim/run 同等 panic 隔离（ekit async 收编
-			// 裸 go 的治理纪律——探测死一个不能打死本实例全部心跳）
-			async.GoSafe(func() { defer wg.Done(); p.heartbeat() })
-			async.GoSafe(func() { defer wg.Done(); p.resetStale() })
-			wg.Wait()
-		}
-	}
 }
 
 // heartbeat TouchRunningHeartbeats（panic 隔离 + 限时，骨架见 guardedCall）。
@@ -157,20 +154,38 @@ func (p *Pool) resetStale() {
 	}
 }
 
-// guardedCall 守护队列调用的统一骨架：panic 隔离（记 panicLog）+ queueCallTimeout
-// 独立限时 ctx + 失败 Warn（failLog）。Queue 是调用方实现（GORM 等），panic 若穿透
-// 会杀死心跳 goroutine——本实例全部在途任务心跳停止 → 90s 后被对端复位重跑
-// （静默双跑），故与 claim/runTask 同等隔离。
-func (p *Pool) guardedCall(panicLog, failLog string, fn func(ctx context.Context) error) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			p.logger().Error(panicLog, "panic", fmt.Sprint(r))
-			err = fmt.Errorf("worker: queue panic: %v", r)
-		}
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), queueCallTimeout)
-	defer cancel()
-	if err = fn(ctx); err != nil {
+// noopPanicReport panic 汇报职责在调用方路径的站点用（claim：loop 的
+// claim_failed 日志已含 worker id 与错误文案）——Handler 置空抑制全局
+// PanicHandler 的 stderr 兜底，库形态消费方不接 SetPanicHandler 的纪律延续。
+var noopPanicReport async.PanicHandler = func(string, []byte) {}
+
+// panicRunner 站点专属 panic 收编（async.Runner，concurrency#12/#13 落地后
+// 回收手搓 recover）：Handler 把 panic 值与栈路由到组件 logger 的站点专属
+// 消息键——v0.15.4 裁定的结构化观测面得以保留，且手搓 recover 时代丢失的
+// panic 栈现在随日志落盘。Runner 是值类型（一个 Handler 字段），按调用点
+// 构造零成本；panic 同时收编为 *async.PanicError 返回，errors.As 可取。
+func (p *Pool) panicRunner(panicLog string) async.Runner {
+	return async.Runner{Handler: func(msg string, stack []byte) {
+		p.logger().Error(panicLog, "panic", msg, "stack", string(stack))
+	}}
+}
+
+// guardedCall 守护队列调用的统一骨架：panic 隔离（记 panicLog，含栈）+
+// queueCallTimeout 独立限时 ctx + 失败 Warn（failLog）。Queue 是调用方实现（GORM 等），
+// panic 若穿透会杀死心跳 goroutine——本实例全部在途任务心跳停止 → 90s 后被
+// 对端复位重跑（静默双跑），故与 claim/runTask 同等隔离。
+func (p *Pool) guardedCall(panicLog, failLog string, fn func(ctx context.Context) error) error {
+	err := p.panicRunner(panicLog).RunSafeErr(func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), queueCallTimeout)
+		defer cancel()
+		return fn(ctx)
+	})
+	var pe *async.PanicError
+	if errors.As(err, &pe) {
+		// 文案与手搓 recover 版逐字一致（panic 值入文案；栈已随 Handler 落日志）
+		return fmt.Errorf("worker: queue panic: %v", pe.Value)
+	}
+	if err != nil {
 		p.logger().Warn(failLog, "error", err.Error())
 	}
 	return err
@@ -241,39 +256,41 @@ func (p *Pool) loop(loopCtx, runCtx context.Context, id int) {
 	}
 }
 
-// claim ClaimNextPending 的 panic 隔离包装：Queue 是调用方实现（GORM 等），
-// panic 若穿透会杀死该 worker goroutine——池静默减员（与 runTask 隔离同一不变量）。
-// 恢复后按 claim 失败路径退避重试。挂死经 ClaimTimeout 兜底。
+// claim ClaimNextPending 的 panic 隔离包装（async.Runner 收编手搓 recover）：
+// Queue 是调用方实现（GORM 等），panic 若穿透会杀死该 worker goroutine——池
+// 静默减员（与 runTask 隔离同一不变量）。恢复后按 claim 失败路径退避重试。
+// 挂死经 ClaimTimeout 兜底。
 func (p *Pool) claim(ctx context.Context) (taskID string, ok bool, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("worker: queue panic: %v", r)
+	err = async.Runner{Handler: noopPanicReport}.RunSafeErr(func() error {
+		timeout := p.ClaimTimeout
+		if timeout <= 0 {
+			timeout = 5 * time.Minute
 		}
-	}()
-	timeout := p.ClaimTimeout
-	if timeout <= 0 {
-		timeout = 5 * time.Minute
+		cctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		taskID, ok, err = p.Queue.ClaimNextPending(cctx)
+		return err
+	})
+	var pe *async.PanicError
+	if errors.As(err, &pe) {
+		err = fmt.Errorf("worker: queue panic: %v", pe.Value)
 	}
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	return p.Queue.ClaimNextPending(cctx)
+	return taskID, ok, err
 }
 
-// runTask 单任务执行（panic 隔离）：任务 panic 只损失该任务——worker 存活继续
-// 拉取，任务由 StaleRunningAfter 心跳过期机制复位重跑；不隔离则 panic 杀死
-// 整个 loop goroutine，池静默减员。
+// runTask 单任务执行（panic 隔离，async.Runner 收编手搓 recover）：任务 panic
+// 只损失该任务——worker 存活继续拉取，任务由 StaleRunningAfter 心跳过期机制
+// 复位重跑；不隔离则 panic 杀死整个 loop goroutine，池静默减员。
 func (p *Pool) runTask(runCtx context.Context, id int, taskID string) {
-	defer func() {
-		if r := recover(); r != nil {
-			// 补全栈：panic 值本身往往不足以定位（下游实弹案例——任务体内
-			// 一处 nil map 赋值,只有「assignment to entry in nil map」一行,
-			// 排查被迫在调用方临时 defer recover+debug.Stack 二次复现）
-			p.logger().Error("agentkit.worker.task_panic", "worker", id, "task", taskID,
-				"panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+	err := async.Runner{Handler: func(msg string, stack []byte) {
+		p.logger().Error("agentkit.worker.task_panic", "worker", id, "task", taskID,
+			"panic", msg, "stack", string(stack))
+	}}.RunSafeErr(func() error { return p.Run(runCtx, taskID) })
+	if err != nil {
+		var pe *async.PanicError
+		if !errors.As(err, &pe) { // panic 已随 Handler 落 task_panic 日志
+			p.logger().Error("agentkit.worker.run_error", "worker", id, "task", taskID, "error", err.Error())
 		}
-	}()
-	if err := p.Run(runCtx, taskID); err != nil {
-		p.logger().Error("agentkit.worker.run_error", "worker", id, "task", taskID, "error", err.Error())
 	}
 }
 
