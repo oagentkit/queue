@@ -34,6 +34,7 @@ import (
 //   - PostgreSQL：pglease.PGLeaseStore（WithTable 换表名；本包 re-export 为
 //     NewPGLeaseStore / PGLeaseStore 别名）
 //   - MySQL / SQLite / PostgreSQL：sqllease.Store（database/sql 三方言）
+//
 // 有自定义需求（非 SQL 存储、多 key 批量等）再自实现——接口不变。
 type LeaseStore interface {
 	// TryAcquire 原子获取或续约租约。key 空闲/已过期/持有者就是 holder →
