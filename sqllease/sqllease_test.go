@@ -18,7 +18,7 @@ func testStore(t *testing.T) *Store {
 		t.Fatal(err)
 	}
 	db.SetMaxOpenConns(1) // :memory: 每连接独立库——共享缓存 + 单连接
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { _ = db.Close() })
 	s := New(db, SQLite)
 	if err := s.Migrate(context.Background()); err != nil {
 		t.Fatal(err)

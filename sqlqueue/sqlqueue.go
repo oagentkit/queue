@@ -59,17 +59,6 @@ func (s *Store) ph(i int) string {
 	return "?"
 }
 
-func (s *Store) nowPlus(phTTL string) string {
-	switch s.dialect {
-	case Postgres:
-		return fmt.Sprintf("now() + make_interval(secs => %s)", phTTL)
-	case MySQL:
-		return fmt.Sprintf("DATE_ADD(NOW(), INTERVAL %s SECOND)", phTTL)
-	default:
-		return fmt.Sprintf("strftime('%%s','now') + %s", phTTL)
-	}
-}
-
 func (s *Store) nowMinus(phSecs string) string {
 	switch s.dialect {
 	case Postgres:
