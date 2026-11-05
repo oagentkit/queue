@@ -21,6 +21,21 @@ import (
 // LeaseStore 租约存储接口（调用方按存储实现：SQL 一行条件 UPSERT 即可）。
 // 语义必须原子：TryAcquire 的"读-判-写"不允许并发穿插（SQL 用
 // `UPDATE ... WHERE key=? AND (holder=? OR expires_at<?)` 条件更新实现）。
+//
+// ⚠️ 时钟语义（自实现者的正确性红线，oagentkit/queue#26）：expires 的写入与
+// 过期判定必须走 **DB 时钟**（同一时钟，如 `expires_at < NOW()` 配
+// `expires_at = NOW() + ttl`），不得用应用侧 time.Now() 写入、DB 侧判定——
+// 副本间应用时钟漂移会等量放大/缩短租约实际时长，削弱「失联后 ≤ttl 换主」
+// 的承诺（NTP 正常时一切完美，漂移几秒时双头/换主延迟且无任何报错——隐蔽
+// 失效形态，pglease v0.10.29 时代的审计修复，下游按旧实现复制的 LeaseStore
+// 会静默丢掉它）。
+//
+// 已有参考实现，**默认路径是直接用**，不要按旧形态自写：
+//   - PostgreSQL：pglease.PGLeaseStore（WithTable 换表名；本包 re-export 为
+//     NewPGLeaseStore / PGLeaseStore 别名）
+//   - MySQL / SQLite / PostgreSQL：sqllease.Store（database/sql 三方言）
+//
+// 有自定义需求（非 SQL 存储、多 key 批量等）再自实现——接口不变。
 type LeaseStore interface {
 	// TryAcquire 原子获取或续约租约。key 空闲/已过期/持有者就是 holder →
 	// 置 holder 并顺延 ttl，返回 true；他人持有未过期 → 返回 false。

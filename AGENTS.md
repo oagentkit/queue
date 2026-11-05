@@ -1,13 +1,13 @@
 # AGENTS.md — oagentkit/queue
 
-> DB 即队列 + Lease 选主，2 个包：`worker` `pglease`
+> DB 即队列 + Lease 选主，4 个包：`worker` `pglease` `sqllease` `sqlqueue`
 > module：`github.com/oagentkit/queue` · org：[oagentkit = Open Agent Kit](https://github.com/oagentkit)
 > 矩阵分层：**tier 2**（集成层，依赖 tier0/tier1 + 重第三方地板）
 
 ## 本仓包含
 
 ```
-worker/  pglease/
+worker/  pglease/  sqllease/  sqlqueue/
 ```
 
 > 注意：`pglease` 原本是 `worker/pglease`，拆分后按三层路径方案提到仓根一级，
@@ -21,6 +21,9 @@ worker/  pglease/
 - 外部依赖：`github.com/oekit/concurrency`（async）、`github.com/oekit/logx`。
 - **`github.com/lib/pq` 是测试依赖**（`pglease` 的 DSN 门控集成测试驱动），
   **生产代码禁止 import**。仓内零生产依赖是刻意设计，不要引入。
+- **`modernc.org/sqlite` 同为测试依赖**（`sqllease`/`sqlqueue` 的内存库单测
+  驱动，纯 Go 无 CGO；版本钉 v1.34.5——新版会顶起 go 指令，下游全体被迫
+  跟进）。**生产代码禁止 import**。
 
 ### 选主语义（正确性红线）
 
