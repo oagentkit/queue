@@ -2,6 +2,8 @@ package worker
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -207,4 +209,42 @@ func TestLeaderElectorStopBoundedWhenAcquireHangs(t *testing.T) {
 	if e.IsLeader() {
 		t.Fatal("挂起期间不得当选")
 	}
+}
+
+// 构造期 fail-fast（queue#27）：ttl/interval 非正此前在后台竞选 goroutine 的
+// time.NewTicker 处运行时 panic（进程被炸，调用方无拦截机会）；key 为空让
+// 多副本竞争语义失效。三者都必须在构造期拦截。
+func TestNewLeaderElectorRejectsInvalidParams(t *testing.T) {
+	store := newMemLeaseStore()
+	cases := []struct {
+		name      string
+		key       string
+		ttl       time.Duration
+		interval  time.Duration
+		wantPanic string
+	}{
+		{"ttl<=0", "k", -time.Second, time.Second, "ttl"},
+		{"interval<=0", "k", time.Second, 0, "interval"},
+		{"empty key", "", time.Second, time.Second, "key"},
+	}
+	for _, c := range cases {
+		func() {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatalf("%s: 应构造期 panic", c.name)
+				}
+				if !strings.Contains(fmt.Sprint(r), c.wantPanic) {
+					t.Fatalf("%s: panic 应指向 %s: %v", c.name, c.wantPanic, r)
+				}
+			}()
+			_ = NewLeaderElector(store, c.key, "h1", c.ttl, c.interval)
+		}()
+	}
+	// 合法参数构造成功且 Start/Stop 正常（构造期校验不误伤）
+	e := NewLeaderElector(store, "k", "h1", time.Second, 100*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	e.Start(ctx)
+	e.Stop()
+	cancel()
 }
