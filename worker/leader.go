@@ -10,6 +10,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,8 +86,22 @@ func WithLeaderLogger(log logx.Logger) LeaderOption {
 }
 
 // NewLeaderElector 创建选主器。interval 建议 ttl/3（失主换主延迟 ≈ ttl + interval）。
+//
+// 参数在**构造期 fail-fast**（panic）：ttl/interval 非正的选主器语义已破
+// （ticker panic / 租约永不过期），而启动后 panic 发生在后台竞选 goroutine
+// 里（oagentkit/queue#27——进程直接被炸，调用方毫无拦截机会），必须在构造
+// 期拦截。参数来自配置文件的宿主在装配期即得到反馈，不是运行期。
 func NewLeaderElector(store LeaseStore, key, holder string, ttl, interval time.Duration,
 	opts ...LeaderOption) *LeaderElector {
+	if ttl <= 0 {
+		panic(fmt.Sprintf("worker: NewLeaderElector ttl 必须 > 0（得到 %v）——非正 ttl 让「失联后 ≤ttl 换主」承诺失效", ttl))
+	}
+	if interval <= 0 {
+		panic(fmt.Sprintf("worker: NewLeaderElector interval 必须 > 0（得到 %v）——非正 interval 在后台 ticker 处 panic（oagentkit/queue#27）", interval))
+	}
+	if key == "" {
+		panic("worker: NewLeaderElector key 不能为空——空 key 让多副本竞争同一把锁的语义失效")
+	}
 	e := &LeaderElector{
 		store:    store,
 		key:      key,
