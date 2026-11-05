@@ -8,8 +8,10 @@ go get github.com/oagentkit/queue
 
 | 包 | 职责 |
 |---|---|
-| `worker` | 任务表驱动的工作池（DB 即队列）+ `LeaseStore` 选主存储接口 |
+| `worker` | 任务表驱动的工作池（DB 即队列）+ `LeaseStore`/`TaskQueue` 存储接口与参考实现 re-export |
 | `pglease` | `worker.LeaseStore` 的 PostgreSQL 实现（条件 UPSERT 一行即成） |
+| `sqllease` | `worker.LeaseStore` 的 database/sql 参考实现（PostgreSQL/MySQL/SQLite 三方言；判-占-续单语句原子 + DB 时钟 + INSERT 冲突降噪） |
+| `sqlqueue` | `worker.TaskQueue` 的 database/sql 参考实现（三方言；守卫 UPDATE 原子抢占 + DB 时钟失联判定 + 心跳批量续期） |
 
 ## 定位
 

@@ -24,6 +24,28 @@ const (
 )
 
 // TaskQueue 任务队列存储接口（调用方实现，如 GORM/MySQL/Redis）。
+//
+// # 时序约束（宿主自实现者的正确性红线，oagentkit/queue#25）
+//
+// TouchRunningHeartbeats 与 ResetRunningToPending 由 Pool 两个独立 goroutine
+// 分别调用（周期由宿主经 Pool 字段配置），两者的组合约束没有兜底——配错
+// 不报错，只以「同一任务双跑」的形式爆出来：
+//
+//   - 心跳周期 T_heartbeat 必须 ≪ staleAfter（ResetRunningToPending 的失联
+//     阈值）：**量化建议 ≥5×**（argus 在役配比 stale_after=90s / 心跳 10s）。
+//     反例：心跳 60s、staleAfter 90s——一次 GC 停顿或网络抖动错过一个心跳
+//     周期，running 任务即被误判失联重置 → 另一副本接手 → 双跑；
+//   - ResetRunningToPending 的 staleAfter 必须 > 单任务的正常执行时长上限：
+//     任务执行超过 staleAfter 且心跳同步失败时，重置会在任务仍在跑时发生
+//     （心跳在跑 = 存活信号，实现方不得只在任务结束时写）；
+//   - 优雅停机（Pool.Stop 的 grace 排水）窗口内**心跳继续续期**：Pool 用
+//     独立于 loopCtx 的 hbCtx 驱动心跳 goroutine（排水中任务仍活着，不该
+//     被他副本判失联接管——自实现的排水逻辑要保住同一承诺）；
+//   - ClaimNextPending 的状态迁移必须单语句原子（WHERE status='pending'
+//     守卫），SELECT-then-UPDATE 两步会竞窗双抢。
+//
+// 参考实现：sqlqueue.Store（database/sql，PostgreSQL/MySQL/SQLite 三方言，
+// 上述纪律一次做对）；argus 的 DB 即队列实现（三方言在役）是素材来源。
 type TaskQueue interface {
 	// ClaimNextPending 原子抢占下一个 pending 任务（pending → running）。
 	ClaimNextPending(ctx context.Context) (taskID string, ok bool, err error)
