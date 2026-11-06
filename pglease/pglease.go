@@ -135,6 +135,36 @@ func (s *PGLeaseStore) Release(ctx context.Context, key, holder string) error {
 	return err
 }
 
+// Cleanup 删除已过期的租约行，返回删除行数。
+//
+// 租约行**只有两种**离开方式：持有者显式 Release（优雅停机），或这里被清掉。
+// 缺了后者，进程崩溃/被杀留下的行会永久占着主键（queue#33）——key 是动态生成的
+// 场景（临时租约、按任务/租户拼 key）下，表只增不减，查询与索引体积一起退化。
+//
+// 过期行**不影响正确性**（TryAcquire 的 ON CONFLICT 子句带
+// `expires_at < now()`，过期行照样可被夺），所以这不是安全修复而是运维面修复：
+// 调用方应周期性调（如随心跳跑，频率取「行数增长可接受」的量级）。
+//
+// 时钟口径与 TryAcquire 一致——用 DB 时钟 now() 而非应用时钟：清理判据与
+// 过期判据必须是同一个钟，否则应用时钟偏慢的副本会把还没过期的行删掉，
+// 等于**替对端提前让位**，双主窗口凭空打开。
+//
+// 与 TryAcquire 的「顺带清理同 key 过期行」不同：那条路径只能清到本次竞争的
+// 那一个 key，高 churn 下绝大多数 key 再也不会有第二次竞争，过期行永远等不到
+// 它的「顺带」——全局扫描是这类表唯一能收敛的形态。
+func (s *PGLeaseStore) Cleanup(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		fmt.Sprintf(`DELETE FROM %s WHERE expires_at < now()`, s.table))
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // Migrate 建租约表。
 func (s *PGLeaseStore) Migrate(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, fmt.Sprintf(`
