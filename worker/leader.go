@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/oekit/concurrency/async"
@@ -67,11 +66,15 @@ type LeaderElector struct {
 	onLost   func()
 	log      logx.Logger
 
-	mu        sync.Mutex
-	leader    bool
-	stop      chan struct{}
-	done      chan struct{} // 竞选 goroutine 退出后关闭（Stop 等待让位完成）
-	started   atomic.Bool
+	mu          sync.Mutex
+	leader      bool
+	everStarted bool          // Start 是否被调用过（Stop 是否该动手，queue#37）
+	stop        chan struct{} // Stop 请求信号
+	// done 竞选定稿且回调已排空（限时）后关闭——Stop 等它，故「Stop 返回」
+	// 同时意味着「不再翻转角色」与「已入队的回调都跑过了」。
+	done      chan struct{}
+	cbCh      chan func()   // 角色翻转回调队列：竞选 goroutine 是唯一写者
+	cbDone    chan struct{} // 回调调度 goroutine 退出后关闭
 	stopOnce  sync.Once
 	startOnce sync.Once
 }
@@ -149,19 +152,29 @@ func NewLeaderElector(store LeaseStore, key, holder string, ttl, interval time.D
 // 重复调用为 no-op（只允许一个竞选 goroutine）。
 func (e *LeaderElector) Start(ctx context.Context) {
 	e.startOnce.Do(func() {
-		// started 同步置位（在拉起 goroutine 之前）：Stop 若在 goroutine 尚未
-		// 跑到 Store(true) 时读到 false 会直接返回，既不等待也不让位，租约泄漏。
+		// everStarted 同步置位（在拉起 goroutine 之前）：Stop 若在 goroutine
+		// 尚未起来时读到 false 会直接返回，既不等待也不让位，租约泄漏。
 		//
 		// 置位与 Stop 的读在同一把锁内：否则存在「Stop 读到 false 当成未启动
 		// no-op，Start 紧接着照常参选」的窗口——调用方以为已停机，选主器还在跑。
 		e.mu.Lock()
-		e.started.Store(true)
+		e.everStarted = true
+		e.cbCh = make(chan func(), callbackQueue)
+		e.cbDone = make(chan struct{})
 		e.mu.Unlock()
+
+		// 回调调度 goroutine：与竞选循环解耦（queue#41），范围读走完 cbCh
+		// 即退出。单个回调的 panic 在 runCallback 内收编，不打死调度器。
+		async.GoSafe(func() {
+			defer close(e.cbDone)
+			for f := range e.cbCh {
+				e.runCallback(f)
+			}
+		})
 		// GoWithContext（ekit v0.29 补齐的携带 ctx 安全 goroutine）：tick 与
 		// select 消费同一个显式传入的 ctx
 		async.GoWithContext(ctx, func(ctx context.Context) {
-			defer close(e.done)
-			defer e.started.Store(false)
+			defer e.finishCampaign()
 			ticker := time.NewTicker(e.interval)
 			defer ticker.Stop()
 			if !e.tick(ctx) {
@@ -206,8 +219,7 @@ func (e *LeaderElector) IsLeader() bool {
 // 砖化」，与 Pool.Stop 的「未启动时 no-op，真正的 Stop 依然有效」语义相反。
 func (e *LeaderElector) Stop() {
 	e.mu.Lock()
-	started := e.started.Load()
-	if !started {
+	if !e.everStarted {
 		// 未启动：no-op，不关闭 e.stop（关闭即砖化后续的 Start）
 		e.mu.Unlock()
 		return
@@ -232,6 +244,15 @@ const releaseTimeout = 5 * time.Second
 
 // acquireTimeout 竞选 TryAcquire 的单次限时（存储挂起时 Stop 不至于无界）。
 const acquireTimeout = 5 * time.Second
+
+// callbackQueue 角色翻转回调队列容量。**只装翻转事件**：稳定复用期间一个 tick
+// 最多产出一个状态，且只在 true/false 真正变化时入队。64 远超任何现实窗口内的
+// 翻转次数——填满说明回调已经卡死。
+const callbackQueue = 64
+
+// callbackDrainTimeout 停机时等待回调排空的限时：回调是通知，不是停机屏障，
+// 卡死的回调不能把 Stop 拖成无界等待。
+const callbackDrainTimeout = 5 * time.Second
 
 // releaseLease 主动释放租约（计划内交接）：失败仅 Warn——租约 ttl 到期会自然失效，
 // 让位失败不阻断停机流程。
@@ -291,6 +312,59 @@ func (e *LeaderElector) yield() {
 	e.log.Info("agentkit.leader.yielded", "key", e.key, "holder", e.holder)
 }
 
+// finishCampaign 竞选 goroutine 的退出收尾：先封住回调队列，再等调度器排空，
+// 最后关 done。
+//
+// 顺序有含义：done 是 Stop 唯一的等待点，所以它必须表示「不再翻转角色**且**
+// 已入队的回调都跑过了」——否则调用方在 Stop 之后读到的组件状态仍是「还没收到
+// onLost」的旧值，而那正是它指望 Stop 保证的事。
+func (e *LeaderElector) finishCampaign() {
+	// 本 goroutine 是 cbCh 的唯一写者（setLeader 只从 tick 里调），
+	// 故此处 close 不会与入队撞上。
+	close(e.cbCh)
+	select {
+	case <-e.cbDone:
+	case <-time.After(callbackDrainTimeout):
+		e.log.Warn("agentkit.leader.callback_drain_timeout",
+			"key", e.key, "waited", callbackDrainTimeout.String(),
+			"action", "角色翻转回调未在限期内返回，Stop 不再等它——回调 goroutine 仍在运行，其组件状态可能滞后")
+	}
+	close(e.done)
+}
+
+// enqueueCallback 把角色翻转回调交给调度 goroutine（queue#41）。
+//
+// 回调曾经在 setLeader 内**同步**执行：一个慢回调（等外部服务、做重活）会把
+// 下一次 tick 顶后，租约在回调执行期间过期、其他副本接管——双主窗口从
+// 「≤一个轮询间隔」扩大成「回调耗时 + 一个轮询间隔」，而本实例的 IsLeader
+// 仍为 true。改成入队后，续约节拍与回调耗时不再互相决定。
+//
+// 反压方向是刻意选的：队列满时**丢通知**而不是阻塞竞选循环。回调卡死时
+// 阻塞入队等于把回调的故障重新传染给续约——正是这条要拆掉的耦合。
+func (e *LeaderElector) enqueueCallback(f func()) {
+	if f == nil {
+		return
+	}
+	select {
+	case e.cbCh <- f:
+	default:
+		e.log.Warn("agentkit.leader.callback_dropped",
+			"key", e.key, "reason", "callback_queue_full",
+			"action", "回调卡死，丢弃本次角色翻转通知；续约不受影响")
+	}
+}
+
+// runCallback 执行单个回调并收编 panic：调度 goroutine 是唯一的回调执行者，
+// 它死了就再也不会有任何回调——用例/宿主的 panic 不能升级成「选主通知永久静默」。
+func (e *LeaderElector) runCallback(f func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			e.log.Warn("agentkit.leader.callback_panic", "key", e.key, "panic", fmt.Sprint(r))
+		}
+	}()
+	f()
+}
+
 func (e *LeaderElector) setLeader(v bool) {
 	e.mu.Lock()
 	if e.stopping() {
@@ -305,13 +379,9 @@ func (e *LeaderElector) setLeader(v bool) {
 	e.mu.Unlock()
 	if v && !prev {
 		e.log.Info("agentkit.leader.gained", "key", e.key, "holder", e.holder, "ttl", e.ttl.String())
-		if e.onGained != nil {
-			e.onGained()
-		}
+		e.enqueueCallback(e.onGained)
 	} else if !v && prev {
 		e.log.Warn("agentkit.leader.lost", "key", e.key, "holder", e.holder)
-		if e.onLost != nil {
-			e.onLost()
-		}
+		e.enqueueCallback(e.onLost)
 	}
 }
