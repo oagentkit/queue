@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/oekit/concurrency/async"
@@ -23,6 +24,18 @@ const (
 	// queueCallTimeout 单次守护队列调用限时（心跳续期/过期复位共用）。
 	queueCallTimeout = 5 * time.Second
 )
+
+// heartbeatInterval 心跳周期（缺省等于导出的 HeartbeatInterval）。用 var 的
+// 唯一理由同 hardExitTimeout：用例要把 20s 压到毫秒级，才能让心跳轮次在
+// Stop 时真的「在飞」——否则那条兜底 Warn 永远验不到。
+var heartbeatInterval = HeartbeatInterval
+
+// hardExitTimeout 停机第二段/心跳等待的兜底：超过即认定对方不理会 ctx，
+// 打 Warn 留痕后继续收尾（不能因为一个卡死的 goroutine 让 Stop 永不返回）。
+//
+// 用 var 不用 const：用例要把 10s 压到毫秒级才能验到那条 Warn，否则单个
+// 用例固定烧 10s。除测试外无人改它。
+var hardExitTimeout = 10 * time.Second
 
 // TaskQueue 任务队列存储接口（调用方实现，如 GORM/MySQL/Redis）。
 //
@@ -113,6 +126,9 @@ type Pool struct {
 
 	inflightMu sync.Mutex          // 保护 inflight
 	inflight   map[string]struct{} // 本进程正在执行的任务（心跳续期集，见 ScopedHeartbeater）
+	// liveWorkers 尚未退出的 worker goroutine 数（atomic）。只在停机超时
+	// 分支里被读——「还有几个没退出」是那条 Warn 唯一能给出的硬信息。
+	liveWorkers int32
 
 	mu         sync.Mutex // 保护 start/stop 生命周期状态
 	started    bool
@@ -164,6 +180,7 @@ func (p *Pool) Start(ctx context.Context) {
 	p.inflightMu.Lock()
 	p.inflight = make(map[string]struct{}, p.N)
 	p.inflightMu.Unlock()
+	atomic.StoreInt32(&p.liveWorkers, int32(p.N))
 	var wg sync.WaitGroup
 	for i := 0; i < p.N; i++ {
 		wg.Add(1)
@@ -172,6 +189,7 @@ func (p *Pool) Start(ctx context.Context) {
 		// 走全局兜底，组件视角不可见）
 		p.panicRunner("agentkit.worker.loop_panic").GoSafe(func() {
 			defer wg.Done()
+			defer atomic.AddInt32(&p.liveWorkers, -1)
 			p.loop(p.loopCtx, p.runCtx, i)
 		})
 	}
@@ -184,8 +202,8 @@ func (p *Pool) Start(ctx context.Context) {
 	// 心跳独立等待：Stop 在任务排空后才停心跳（在途任务的心跳不能先死），
 	// 故不与 worker 同 wg——done 关闭不依赖心跳退出
 	hbLoop := loop.Run(p.hbCtx, loop.Config{
-		Interval:   HeartbeatInterval,
-		FirstDelay: HeartbeatInterval,
+		Interval:   heartbeatInterval,
+		FirstDelay: heartbeatInterval,
 		Name:       "agentkit.worker.heartbeat",
 	}, func(ctx context.Context) {
 		// 两个调用各自限时，互不挤占；并行跑——原先串行时 resetStale 慢
@@ -326,8 +344,8 @@ func (p *Pool) Stop(grace time.Duration) {
 		p.mu.Unlock()
 		return
 	}
-	cancelLoop, cancelRun, cancelHB, done, hbDone, log :=
-		p.cancelLoop, p.cancelRun, p.cancelHB, p.done, p.hbDone, p.logger()
+	cancelLoop, cancelRun, cancelHB, done, hbDone, log, workers :=
+		p.cancelLoop, p.cancelRun, p.cancelHB, p.done, p.hbDone, p.logger(), p.N
 	p.mu.Unlock()
 
 	p.stopOnce.Do(func() {
@@ -340,7 +358,16 @@ func (p *Pool) Stop(grace time.Duration) {
 			cancelRun()
 			select {
 			case <-done:
-			case <-time.After(10 * time.Second):
+			case <-time.After(hardExitTimeout):
+				// 静默遗弃是这里最坏的选项：worker 卡在不理会 ctx 的 Run 里，
+				// Stop 却照样置 stopped 并打 Info，运维读到的是「干净停机」。
+				// 状态位仍置（Pool 单次生命周期，stopOnce 已消耗——泄漏的
+				// goroutine 没有救回来的路径），所以留痕是唯一诚实的做法。
+				log.Warn("agentkit.worker.stop_exit_timeout",
+					"stuck_workers", atomic.LoadInt32(&p.liveWorkers),
+					"workers", workers,
+					"waited", hardExitTimeout.String(),
+					"action", "worker 未在硬取消后退出（Run 不理会 ctx？），本 Pool 已标记 stopped，这些 goroutine 仍在运行")
 			}
 		}
 		// 心跳最后停：排空窗口内（含硬取消后的收尾）在途任务仍需续期，
@@ -348,7 +375,10 @@ func (p *Pool) Stop(grace time.Duration) {
 		cancelHB()
 		select {
 		case <-hbDone:
-		case <-time.After(10 * time.Second): // 心跳调用各自限时 5s，兜底不悬挂
+		case <-time.After(hardExitTimeout): // 心跳调用各自限时 5s，兜底不悬挂
+			log.Warn("agentkit.worker.stop_heartbeat_timeout",
+				"waited", hardExitTimeout.String(),
+				"action", "心跳循环未退出，其 goroutine 仍在运行")
 		}
 		p.mu.Lock()
 		p.stopped = true
