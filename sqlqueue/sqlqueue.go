@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -113,10 +114,41 @@ WHERE task_id = %s AND status = 'pending'`,
 }
 
 // TouchRunningHeartbeats 续期本实例 running 任务的心跳（批量单 UPDATE）。
+//
+// 这是 worker.TaskQueue 的盲续语义：**不区分「我在跑它」与「它归我」**，
+// 故 runTask 已退出的任务也会被续活（oagentkit/queue#42）。Pool 检测到本类型
+// 实现了 worker.ScopedHeartbeater（见下）后不再调用本方法；保留它是为了
+// 接口完整性与「不用 Pool、直接驱动队列」的宿主。
 func (s *Store) TouchRunningHeartbeats(ctx context.Context) error {
 	q := fmt.Sprintf(`UPDATE %s SET heartbeat_at = %s
 WHERE runner_id = %s AND status = 'running'`, s.table, s.nowFn(), s.ph(1))
 	_, err := s.db.ExecContext(ctx, q, s.runnerID)
+	return err
+}
+
+// TouchHeartbeatsFor 只续期 taskIDs 中属于本实例且在跑的任务心跳
+// （worker.ScopedHeartbeater 实现）。
+//
+// 三重守卫缺一不可：runner_id 防续他实例的行，status='running' 防把已终态
+// 的行续回新鲜，task_id IN (...) 是本次修复的实质——不在续期集里的行
+// （runTask 已 panic/报错/成功退出的）心跳就此冻结，staleAfter 后由
+// ResetRunningToPending 复位重跑。
+func (s *Store) TouchHeartbeatsFor(ctx context.Context, taskIDs []string) error {
+	if len(taskIDs) == 0 {
+		// 空集绝不能退化成「无过滤条件」——那是盲续，正是要修的东西
+		return nil
+	}
+	marks := make([]string, len(taskIDs))
+	args := make([]any, 0, len(taskIDs)+1)
+	args = append(args, s.runnerID) // 占位符 1 是 runner_id
+	for i, id := range taskIDs {
+		marks[i] = s.ph(i + 2)
+		args = append(args, id)
+	}
+	q := fmt.Sprintf(`UPDATE %s SET heartbeat_at = %s
+WHERE runner_id = %s AND status = 'running' AND task_id IN (%s)`,
+		s.table, s.nowFn(), s.ph(1), strings.Join(marks, ", "))
+	_, err := s.db.ExecContext(ctx, q, args...)
 	return err
 }
 
