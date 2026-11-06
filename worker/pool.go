@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -50,9 +51,52 @@ type TaskQueue interface {
 	// ClaimNextPending 原子抢占下一个 pending 任务（pending → running）。
 	ClaimNextPending(ctx context.Context) (taskID string, ok bool, err error)
 	// TouchRunningHeartbeats 续期本实例 running 任务的心跳。
+	//
+	// 实现方若想支持「本进程已不再执行的任务尽快失联复位」，请**额外**实现
+	// ScopedHeartbeater：Pool 会优先走按在飞任务集续期，本方法不再被调用。
+	// 未实现时本方法是盲续——它按 runner_id 续期全部 running 行，包括
+	// runTask 已 panic/报错退出、但行仍停在 running 的任务（oagentkit/queue#42）。
 	TouchRunningHeartbeats(ctx context.Context) error
 	// ResetRunningToPending 重置心跳已死的 running 任务回 pending。
 	ResetRunningToPending(ctx context.Context, staleAfter time.Duration) (int64, error)
+}
+
+// ScopedHeartbeater 是 TaskQueue 的**可选能力**（类型断言探测，不改 TaskQueue
+// 接口本身）：TaskQueue 的实现方在仓外（宿主自实现的 GORM/Redis 队列），
+// 往接口里加方法就是破坏性变更——所有现有实现当场编译不过。用可选接口
+// 表达「能做得更好的一种实现」，未实现者行为一字不变。
+//
+// 实现本接口后，Pool 的心跳只续期「本进程真正在跑」的任务；runTask 返回
+// （成功、报错、panic）后该任务立即移出续期集，其 heartbeat_at 随之冻结，
+// staleAfter 后由 ResetRunningToPending 复位重跑——这正是
+// Pool.runTask 注释宣称的恢复契约。
+//
+// # 为什么必须按任务集续期（oagentkit/queue#42）
+//
+// 盲续（TouchRunningHeartbeats）的结构性缺陷不是一个 bug 而是一个
+// 不可能同时成立的两难：
+//
+//   - 任务 panic/报错后，行仍停在 status='running' + runner_id=本实例
+//     （Pool 不写终态，宿主负责）；
+//   - 只要本进程还活着（继续领别的任务、心跳继续跑），盲续就会把这些行
+//     的心跳一直续成新鲜的；
+//   - 于是 ResetRunningToPending(staleAfter) 永不命中——「心跳过期复位」
+//     这条恢复路径对「同进程内失败的任务」**结构性失效**，任务永久卡
+//     running 且无人标记终态（静默丢失）。
+//
+// 排除集（只续期在飞任务）把两件事分开了：「我在跑它」是活信号，
+// 「它归我」不是。
+//
+// # 实现方的三条约束
+//
+//   - 只动 caller 传入的 taskIDs，且必须同时按 runner_id 与 status='running'
+//     守卫（不得续期他实例的行，也不得把已终态的行续回新鲜）；
+//   - 传入空集时**不要**当成「续期全部」——Pool 在空集时根本不会调用，
+//     但实现方自守一层可以防住「空切片 = 无过滤条件」这类 SQL 拼装错误；
+//   - 集大小受 Pool.N 约束（同时最多 N 个在飞任务），无需分页。
+type ScopedHeartbeater interface {
+	// TouchHeartbeatsFor 只续期 taskIDs 中属于本实例且在跑的任务心跳。
+	TouchHeartbeatsFor(ctx context.Context, taskIDs []string) error
 }
 
 // Pool worker 池。
@@ -66,6 +110,9 @@ type Pool struct {
 	// Queue 是调用方实现（GORM 等），与 runTask/claim 的 panic 隔离同一不变量：
 	// 外部代码异常不得让 worker 永久僵死——超时按 claim 失败退避重试。
 	ClaimTimeout time.Duration
+
+	inflightMu sync.Mutex          // 保护 inflight
+	inflight   map[string]struct{} // 本进程正在执行的任务（心跳续期集，见 ScopedHeartbeater）
 
 	mu         sync.Mutex // 保护 start/stop 生命周期状态
 	started    bool
@@ -114,6 +161,9 @@ func (p *Pool) Start(ctx context.Context) {
 	p.hbCtx, p.cancelHB = context.WithCancel(ctx)
 	p.done = make(chan struct{})
 	p.hbDone = make(chan struct{})
+	p.inflightMu.Lock()
+	p.inflight = make(map[string]struct{}, p.N)
+	p.inflightMu.Unlock()
 	var wg sync.WaitGroup
 	for i := 0; i < p.N; i++ {
 		wg.Add(1)
@@ -155,10 +205,64 @@ func (p *Pool) Start(ctx context.Context) {
 	p.logger().Info("agentkit.worker.started", "workers", p.N)
 }
 
-// heartbeat TouchRunningHeartbeats（panic 隔离 + 限时，骨架见 guardedCall）。
+// heartbeat 续期本实例心跳（panic 隔离 + 限时，骨架见 guardedCall）。
+//
+// Queue 实现 ScopedHeartbeater 时按本进程在飞任务集续期（空集直接跳过，
+// 不发无过滤条件的 UPDATE）；否则退回盲续 TouchRunningHeartbeats——
+// 那条路径下「panic 任务靠心跳过期复位」不成立，见 ScopedHeartbeater 文档。
 func (p *Pool) heartbeat() {
+	sh, scoped := p.Queue.(ScopedHeartbeater)
+	if !scoped {
+		_ = p.guardedCall("agentkit.worker.heartbeat_panic", "agentkit.worker.heartbeat_failed",
+			p.Queue.TouchRunningHeartbeats)
+		return
+	}
+	ids := p.inflightSnapshot()
+	if len(ids) == 0 {
+		// 无在飞任务：不调用。盲续在这里恰好是「把已失败任务续活」的那一步，
+		// 所以「没事可续」必须是**不发语句**而不是「发一条全量续期」。
+		return
+	}
 	_ = p.guardedCall("agentkit.worker.heartbeat_panic", "agentkit.worker.heartbeat_failed",
-		p.Queue.TouchRunningHeartbeats)
+		func(ctx context.Context) error { return sh.TouchHeartbeatsFor(ctx, ids) })
+}
+
+// trackStart 把任务登记进续期集（claim 成功后、Run 之前调用）。
+func (p *Pool) trackStart(taskID string) {
+	p.inflightMu.Lock()
+	if p.inflight == nil { // 未经 Start 直接驱动 loop 的用法（测试/自实现）兜底
+		p.inflight = make(map[string]struct{})
+	}
+	p.inflight[taskID] = struct{}{}
+	p.inflightMu.Unlock()
+}
+
+// trackDone 把任务移出续期集（runTask 返回后无条件调用——成功/报错/panic
+// 三种收尾都要移出，否则恢复契约对它不成立）。
+func (p *Pool) trackDone(taskID string) {
+	p.inflightMu.Lock()
+	delete(p.inflight, taskID)
+	p.inflightMu.Unlock()
+}
+
+// inflightSnapshot 取续期集的稳定快照（排序：日志与 SQL 参数顺序可复现）。
+func (p *Pool) inflightSnapshot() []string {
+	p.inflightMu.Lock()
+	ids := make([]string, 0, len(p.inflight))
+	for id := range p.inflight {
+		ids = append(ids, id)
+	}
+	p.inflightMu.Unlock()
+	sort.Strings(ids)
+	return ids
+}
+
+// runTracked 登记 → 执行 → 注销。defer 保证 panic 路径也注销（runTask 已
+// 自隔离 panic，这里是不依赖其实现的兜底）。
+func (p *Pool) runTracked(runCtx context.Context, id int, taskID string) {
+	p.trackStart(taskID)
+	defer p.trackDone(taskID)
+	p.runTask(runCtx, id, taskID)
 }
 
 // resetStale ResetRunningToPending（panic 隔离 + 限时，骨架见 guardedCall）。
@@ -274,7 +378,7 @@ func (p *Pool) loop(loopCtx, runCtx context.Context, id int) {
 			continue
 		}
 		p.logger().Info("agentkit.worker.claimed", "worker", id, "task", taskID)
-		p.runTask(runCtx, id, taskID)
+		p.runTracked(runCtx, id, taskID)
 	}
 }
 
@@ -301,8 +405,13 @@ func (p *Pool) claim(ctx context.Context) (taskID string, ok bool, err error) {
 }
 
 // runTask 单任务执行（panic 隔离，async.Runner 收编手搓 recover）：任务 panic
-// 只损失该任务——worker 存活继续拉取，任务由 StaleRunningAfter 心跳过期机制
-// 复位重跑；不隔离则 panic 杀死整个 loop goroutine，池静默减员。
+// 只损失该任务——worker 存活继续拉取；不隔离则 panic 杀死整个 loop goroutine，
+// 池静默减员。
+//
+// 恢复契约（「任务由 StaleRunningAfter 心跳过期机制复位重跑」）**只在 Queue
+// 实现 ScopedHeartbeater 时成立**：盲续实现会把这个已退出任务的
+// heartbeat_at 一直续成新鲜的，reset 永不命中（oagentkit/queue#42）。
+// 调用点在 runTracked 里，它负责把任务移出续期集。
 func (p *Pool) runTask(runCtx context.Context, id int, taskID string) {
 	err := async.Runner{Handler: func(msg string, stack []byte) {
 		p.logger().Error("agentkit.worker.task_panic", "worker", id, "task", taskID,
