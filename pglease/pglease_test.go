@@ -19,6 +19,11 @@ import (
 // 编译期断言：满足 worker.LeaseStore 接口。
 var _ worker.LeaseStore = (*pglease.PGLeaseStore)(nil)
 
+// 编译期断言：同时满足可选的 worker.TokenLeaseStore（queue#39）。
+// 这条断言是「参考实现真的能当 token 存储用」的唯一机械保证——漏了它，
+// 接口与实现会各自演进到「类型断言恒失败而两边都编译得过」。
+var _ worker.TokenLeaseStore = (*pglease.PGLeaseStore)(nil)
+
 func TestImplementsLeaseStore(t *testing.T) {
 	var s worker.LeaseStore = pglease.NewPGLeaseStore(&sql.DB{})
 	_ = s

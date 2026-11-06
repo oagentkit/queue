@@ -1,6 +1,33 @@
 // Package pglease — worker.LeaseStore 的 PostgreSQL 实现。
 // 多副本对同一 key 竞争时由数据库行级约束保证唯一 winner。
 // 走 database/sql 直执行——绕开 ORM 预编译缓存的参数计数问题。
+//
+// # 两档持有契约（queue#39）
+//
+// 租约能保证「同一时刻至多一个 winner」，但**不能**保证「winner 不知道自己
+// 已经输了」：租约过期被别的副本接管后，旧持有者在下一次 TryAcquire 之前
+// 一直以为自己是主。这个窗口是租约语义的固有形态（worker.LeaderElector 头注释
+// 已把它限定为「≤一个轮询间隔」），区别只在于**调用方拿什么去容忍它**：
+//
+//   - **不取 token（TryAcquire，现状语义不变）**：容忍粒度 = 轮询间隔。
+//     适合「输一会儿无所谓」的动作——幂等清理、周期性对账、缓存刷新。
+//
+//   - **取 token（TryAcquireWithToken）**：容忍粒度 = **一次写事务**。
+//     业务行上存「最后一次被接受的写的 token」，动作落库带
+//     `WHERE ... AND generation <= $token`，易主后旧持有者的写被数据库
+//     原子拒绝（影响行数 0），而不是静默覆盖新主的数据。
+//
+//     判据取 `<=` 而不是 `=`：`=` 只适用于「每个任期重建的业务行」，
+//     真实表是长期存活的，新主接手时行上还是旧 token ⇒ `=` 会把**新主的首写**
+//     一并拒掉（实测 0 行）。`<=` 让同一持有者反复写、严格更旧的 token 恒被拒，
+//     代价是「新主接管后首写之前」旧主的写仍可能落地——那一段由「接管后立即
+//     写一次」关闭（pglease_integration_test.go 的成对用例就是这条纪律的样板）。
+//
+// token 的语义是**单调 fencing token**：同一 holder 续约时**保持不变**
+// （它没丢过权，在飞的动作不该被自己作废）；行易主时 **+1**（旧值从此作废，
+// 且永不回退）。所以「旧 token 仍然可用」这件事在数据库层是不可能的——
+// 这正是它比「动作前再查一次 holder 是不是我」更强的地方：后者的判据
+// （holder 名）会被同名副本复用，token 不会。
 package pglease
 
 import (
@@ -123,6 +150,63 @@ WHERE %s.expires_at < now() OR %s.holder = EXCLUDED.holder`, s.table, s.table, s
 	return n > 0, err
 }
 
+// TryAcquireWithToken 同 TryAcquire，并返回本次持有的 **fencing token**
+// （queue#39）。返回的 token 可直接用于动作点的 CAS——业务行存「最后一次被
+// 接受的写的 token」，写条件用 `<=`：
+//
+//	ok, gen, err := store.TryAcquireWithToken(ctx, "k", "replica-a", 15*time.Second)
+//	// ... 动作落库时：
+//	//   UPDATE biz SET payload = $3
+//	//    WHERE id = $1 AND generation <= $2   -- $2 = gen，写成功同时把行推到 gen
+//	//
+//	// ⚠️ 别写成 `generation = $2`：那要求每个任期重建业务行，否则**新主的首写**
+//	// 会被自己拒掉（行上还是旧 token）。接管后先写一次可关闭前后任交叠的窗口。
+//
+// 拿不到租约（他人持有且未过期）→ (false, 0, nil)，token 无意义。
+//
+// token 的单调性由 SQL 保证，不是应用侧计数器：
+//   - 首次插入 → 1；
+//   - 同一 holder 续约 → **保持原值**（它没丢过权，在飞动作不该被自己作废）；
+//   - 易主（不同 holder 抢到）→ **+1**，旧值从此作废且永不回退。
+//
+// 为什么「易主才 +1」而不是「每次获取都 +1」：每次 +1 会让持有者在**正常续约**
+// 时作废自己刚排队的写（续约与写并发时，一个极常见的时序），把 fencing 变成
+// 「随机丢写」；而「只有易主才变」恰好就是它要表达的语义——权没换，token 就不该换。
+//
+// ⚠️ 依赖 `generation` 列：旧库必须先跑 Migrate（幂等补列，见下）。
+func (s *PGLeaseStore) TryAcquireWithToken(ctx context.Context, key, holder string, ttl time.Duration) (bool, int64, error) {
+	if err := validateIdentity(key, holder); err != nil {
+		return false, 0, err
+	}
+	if err := validateTTL(ttl); err != nil {
+		return false, 0, err
+	}
+	var gen int64
+	// RETURNING + ON CONFLICT：命中冲突且 WHERE 不成立时**不返回行**，
+	// 于是「是否抢到」与「拿到哪个 token」是同一次原子操作的产物——
+	// 分两条语句（先判后读）会在两者之间插进另一个写者，读到的可能是别人的 token。
+	err := s.db.QueryRowContext(ctx, fmt.Sprintf(`
+INSERT INTO %[1]s (key, holder, expires_at, generation)
+VALUES ($1, $2, now() + make_interval(secs => $3), 1)
+ON CONFLICT (key) DO UPDATE SET
+  holder     = EXCLUDED.holder,
+  expires_at = EXCLUDED.expires_at,
+  generation = CASE WHEN %[1]s.holder = EXCLUDED.holder
+                    THEN %[1]s.generation
+                    ELSE %[1]s.generation + 1 END
+WHERE %[1]s.expires_at < now() OR %[1]s.holder = EXCLUDED.holder
+RETURNING generation`, s.table),
+		key, holder, ttl.Seconds()).Scan(&gen)
+	if errors.Is(err, sql.ErrNoRows) {
+		// 他人持有且未过期：没抢到，token 无意义。这不是错误。
+		return false, 0, nil
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	return true, gen, nil
+}
+
 // Release 仅持有者本人可释放（优雅停机让位，加速故障转移）。
 // key 或 holder 为空 → 错误：空 holder 的 DELETE 会删掉 holder=” 那把锁，
 // 而调用方给不出「本人」的证据（见 validateIdentity）。
@@ -165,13 +249,27 @@ func (s *PGLeaseStore) Cleanup(ctx context.Context) (int64, error) {
 	return n, nil
 }
 
-// Migrate 建租约表。
+// Migrate 建租约表，并给**旧表**幂等补上 generation 列。
+//
+// 两步而不是一步：`CREATE TABLE IF NOT EXISTS` 对已存在的表是 no-op，
+// 所以「表早就建好、只是没有 generation 列」的库（本版之前的所有部署）
+// 靠它一行都补不上——TryAcquireWithToken 会在运行期报
+// `column "generation" does not exist`，而 TryAcquire 照常工作，
+// 于是症状表现为「只有想用 fencing 的那条路径坏了」。
+// 故补列单独走 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`（PG 幂等，
+// 可反复跑）。`NOT NULL DEFAULT 1` 让存量行直接可读：它们是 fencing 之前
+// 的行，首次易主时自然涨到 2。
 func (s *PGLeaseStore) Migrate(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
   key        VARCHAR(64) PRIMARY KEY,
   holder     VARCHAR(128) NOT NULL,
-  expires_at TIMESTAMPTZ  NOT NULL
-)`, s.table))
+  expires_at TIMESTAMPTZ  NOT NULL,
+  generation BIGINT       NOT NULL DEFAULT 1
+)`, s.table)); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		`ALTER TABLE %s ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 1`, s.table))
 	return err
 }
