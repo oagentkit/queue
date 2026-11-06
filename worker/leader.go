@@ -151,7 +151,12 @@ func (e *LeaderElector) Start(ctx context.Context) {
 	e.startOnce.Do(func() {
 		// started 同步置位（在拉起 goroutine 之前）：Stop 若在 goroutine 尚未
 		// 跑到 Store(true) 时读到 false 会直接返回，既不等待也不让位，租约泄漏。
+		//
+		// 置位与 Stop 的读在同一把锁内：否则存在「Stop 读到 false 当成未启动
+		// no-op，Start 紧接着照常参选」的窗口——调用方以为已停机，选主器还在跑。
+		e.mu.Lock()
 		e.started.Store(true)
+		e.mu.Unlock()
 		// GoWithContext（ekit v0.29 补齐的携带 ctx 安全 goroutine）：tick 与
 		// select 消费同一个显式传入的 ctx
 		async.GoWithContext(ctx, func(ctx context.Context) {
@@ -191,12 +196,25 @@ func (e *LeaderElector) IsLeader() bool {
 
 // Stop 停止竞选并主动让位（幂等；优雅停机的计划内交接，不触发 onLost）。
 // 等待竞选 goroutine 退出后返回——返回后 IsLeader 必为 false 且租约已让出。
-// Start 未被调用时立即返回（无租约可让）。
+// Start 未被调用时立即返回（无租约可让），且**不消耗停机状态**：此后 Start
+// 依然能正常参选，之后真正的 Stop 也依然有效。
+//
+// 后半句是本方法唯一需要小心的地方（oagentkit/queue#37）：曾无条件
+// `close(e.stop)`，于是「Start 之前误调一次 Stop」就把 startOnce 与 stop 一起
+// 烧掉——之后的 Start 其竞选 goroutine 首个 tick 即 stopping()==true 直接退出，
+// 选主器永不参选、IsLeader() 恒 false，无日志无错误。这是「误调用一次即静默
+// 砖化」，与 Pool.Stop 的「未启动时 no-op，真正的 Stop 依然有效」语义相反。
 func (e *LeaderElector) Stop() {
-	e.stopOnce.Do(func() { close(e.stop) })
-	if e.started.Load() {
-		<-e.done
+	e.mu.Lock()
+	started := e.started.Load()
+	if !started {
+		// 未启动：no-op，不关闭 e.stop（关闭即砖化后续的 Start）
+		e.mu.Unlock()
+		return
 	}
+	e.stopOnce.Do(func() { close(e.stop) })
+	e.mu.Unlock()
+	<-e.done
 }
 
 // stopping 已请求停止。
