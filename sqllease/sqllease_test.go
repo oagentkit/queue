@@ -3,6 +3,7 @@ package sqllease
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -131,5 +132,83 @@ func TestConcurrentColdStart(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Fatalf("冷启动并发首抢不应有错误外露: %v", err)
+	}
+}
+
+// TestEmptyIdentityRejected 空 key / 空 holder 必须在**拼 SQL 之前**被拒
+// （queue#43）：条件 UPDATE 的「本人持有则顺延」是内容比对 `holder = ?`，
+// 空串对它恒真 ⇒ 所有空 holder 副本互相认作本人 ⇒ 双主且零报错。
+//
+// 反向验证锚点：去掉 validateIdentity 调用后，本用例第一条会拿到
+// (ok=true, err=nil)——不是「报了个别的错」，而是**选举语义直接破产**。
+func TestEmptyIdentityRejected(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", "file:emptyident?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	s := New(db, SQLite)
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 伪造一行 holder='' 的脏租约（旧版/他实现留下的形态）。
+	// 刻意设成**已过期**：这样第四步的合法 holder 能接管它，从而证明校验不误伤；
+	// 而第一步的空 holder 在旧实现里靠的是 `holder = ?` 命中（与过期无关）——
+	// 过期与否都不影响「双主」这条断言。
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO agentkit_lease (key, holder, expires_at) VALUES (?, ?, ?)`,
+		"lead", "", time.Now().Add(-time.Minute).Unix()); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1) 空 holder 抢同一把 key：必须报错，且**不得**命中 holder='' 那行
+	ok, err := s.TryAcquire(ctx, "lead", "", time.Minute)
+	if !errors.Is(err, ErrEmptyHolder) {
+		t.Fatalf("空 holder 应返回 ErrEmptyHolder，得到 ok=%v err=%v——命中即双主", ok, err)
+	}
+	if ok {
+		t.Fatal("空 holder 不得被判定为获取成功（双主）")
+	}
+	// 脏行必须原封不动（被拒的调用零副作用）
+	var holder string
+	if err := db.QueryRowContext(ctx,
+		`SELECT holder FROM agentkit_lease WHERE key = ?`, "lead").Scan(&holder); err != nil {
+		t.Fatalf("脏行应保留: %v", err)
+	}
+	if holder != "" {
+		t.Fatalf("被拒的 TryAcquire 不得改写 holder，得到 %q", holder)
+	}
+
+	// 2) 空 key 同理
+	if _, err := s.TryAcquire(ctx, "", "a", time.Minute); !errors.Is(err, ErrEmptyKey) {
+		t.Fatalf("空 key 应返回 ErrEmptyKey，得到 %v", err)
+	}
+
+	// 3) 空 holder 的 Release：DELETE 的 `holder = ?` 同样恒真 ⇒ 会删掉那把
+	//    它认不出的锁。必须报错，且行仍在。
+	if err := s.Release(ctx, "lead", ""); !errors.Is(err, ErrEmptyHolder) {
+		t.Fatalf("空 holder 的 Release 应返回 ErrEmptyHolder，得到 %v", err)
+	}
+	if err := s.Release(ctx, "", "a"); !errors.Is(err, ErrEmptyKey) {
+		t.Fatalf("空 key 的 Release 应返回 ErrEmptyKey，得到 %v", err)
+	}
+	var n int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM agentkit_lease WHERE key = ?`, "lead").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("空 holder 的 Release 不得删行，剩余行数 %d", n)
+	}
+
+	// 4) 成对正例：合法身份照常工作（校验不误伤）
+	if ok, err := s.TryAcquire(ctx, "lead", "a", time.Minute); err != nil || !ok {
+		t.Fatalf("合法 holder 应能接管过期/空 holder 的脏行: ok=%v err=%v", ok, err)
+	}
+	if err := s.Release(ctx, "lead", "a"); err != nil {
+		t.Fatalf("合法 Release: %v", err)
 	}
 }

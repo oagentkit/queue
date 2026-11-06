@@ -37,12 +37,21 @@ import (
 //   - MySQL / SQLite / PostgreSQL：sqllease.Store（database/sql 三方言）
 //
 // 有自定义需求（非 SQL 存储、多 key 批量等）再自实现——接口不变。
+//
+// ⚠️ 实现方**必须**对空 key / 空 holder 报错（而不是当成普通值）：
+// 「本人持有则顺延」的判定是内容比对（`holder = ?` / `holder = EXCLUDED.holder`），
+// 空串对它恒真 ⇒ 所有空 holder 副本互相认作本人 ⇒ 双主且零报错（queue#43）。
+// NewLeaderElector 的构造期 panic 只拦按规矩走它的调用方，直接用本接口的
+// 调用方需要库层这道护栏。
 type LeaseStore interface {
 	// TryAcquire 原子获取或续约租约。key 空闲/已过期/持有者就是 holder →
 	// 置 holder 并顺延 ttl，返回 true；他人持有未过期 → 返回 false。
+	// key 或 holder 为空 → 返回错误（不得静默当成普通值，见上方 ⚠️）。
 	TryAcquire(ctx context.Context, key, holder string, ttl time.Duration) (bool, error)
 	// Release 释放租约（仅持有者本人生效；优雅停机让位）。
 	// 非持有者或 key 不存在 → no-op 返回 nil。
+	// key 或 holder 为空 → 返回错误（空 holder 的 DELETE 会删掉
+	// `holder = ''` 那把锁——正是它认不出的那把）。
 	Release(ctx context.Context, key, holder string) error
 }
 
@@ -101,6 +110,13 @@ func NewLeaderElector(store LeaseStore, key, holder string, ttl, interval time.D
 	}
 	if key == "" {
 		panic("worker: NewLeaderElector key 不能为空——空 key 让多副本竞争同一把锁的语义失效")
+	}
+	// holder 与 key 是一对身份：key 指「哪把锁」，holder 指「谁在持」。
+	// 空 holder 不是「没名字」而是**所有副本共用同一个名字**——租约实现的
+	// 「本人持有则顺延」条件（`holder = ?` / `holder = EXCLUDED.holder`）对
+	// 空串恒真 ⇒ 多副本同时自认 leader，而选举语义零报破产（queue#43）。
+	if holder == "" {
+		panic("worker: NewLeaderElector holder 不能为空——空 holder 让所有副本在租约层互相「本人持有」互认，双主无任何报错（oagentkit/queue#43）")
 	}
 	e := &LeaderElector{
 		store:    store,
