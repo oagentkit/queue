@@ -48,9 +48,11 @@ func (m *memLeaseStore) Release(_ context.Context, key, holder string) error {
 
 func TestLeaderElectorGainedAndHandover(t *testing.T) {
 	store := newMemLeaseStore()
-	var gainedA, lostA int
+	// 回调由独立调度 goroutine 执行（queue#41），故计数必须原子读——
+	// 断言点仍在 Stop / done 之后，那里回调已排空。
+	var gainedA, lostA atomic.Int32
 	a := NewLeaderElector(store, "poller", "A", 200*time.Millisecond, 50*time.Millisecond,
-		WithOnGained(func() { gainedA++ }), WithOnLost(func() { lostA++ }),
+		WithOnGained(func() { gainedA.Add(1) }), WithOnLost(func() { lostA.Add(1) }),
 		WithLeaderLogger(logx.NewSlogLogger("test")))
 	ctx, cancel := context.WithCancel(context.Background())
 	a.Start(ctx)
@@ -82,8 +84,8 @@ func TestLeaderElectorGainedAndHandover(t *testing.T) {
 	if !b.IsLeader() {
 		t.Fatal("A 让位后 B 应当选")
 	}
-	if lostA != 0 {
-		t.Fatalf("Stop 主动让位不应触发 onLost: %d", lostA)
+	if n := lostA.Load(); n != 0 {
+		t.Fatalf("Stop 主动让位不应触发 onLost: %d", n)
 	}
 	cancel()
 }
@@ -141,9 +143,9 @@ func TestLeaderElectorStopWithInflightTick(t *testing.T) {
 	// 刚获得的租约必须立即让出；Stop 返回后 IsLeader=false 且存储中无本持有者租约。
 	store := &gatedLeaseStore{memLeaseStore: *newMemLeaseStore(), gate: make(chan struct{})}
 	store.first.Store(true) // 首次 TryAcquire 阻塞在 gate
-	var gained int
+	var gained atomic.Int32
 	e := NewLeaderElector(store, "poller", "A", time.Minute, 10*time.Millisecond,
-		WithOnGained(func() { gained++ }), WithLeaderLogger(logx.NewSlogLogger("test")))
+		WithOnGained(func() { gained.Add(1) }), WithLeaderLogger(logx.NewSlogLogger("test")))
 	e.Start(context.Background())
 	time.Sleep(50 * time.Millisecond) // 等竞选 goroutine 阻塞在首次 TryAcquire 的 gate 上
 
@@ -160,8 +162,8 @@ func TestLeaderElectorStopWithInflightTick(t *testing.T) {
 	if e.IsLeader() {
 		t.Fatal("Stop 后 IsLeader 应为 false")
 	}
-	if gained != 0 {
-		t.Fatalf("stop 后在途 acquire 不得宣布当选: onGained 触发 %d 次", gained)
+	if n := gained.Load(); n != 0 {
+		t.Fatalf("stop 后在途 acquire 不得宣布当选: onGained 触发 %d 次", n)
 	}
 	store.mu.Lock()
 	holder, held := store.holder["poller"]
