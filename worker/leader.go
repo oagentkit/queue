@@ -54,6 +54,33 @@ type LeaseStore interface {
 	Release(ctx context.Context, key, holder string) error
 }
 
+// TokenLeaseStore 是 LeaseStore 的**可选**加强：把「怎么容忍脑裂窗口」从
+// 调用方的玄学变成库层选项（queue#39）。
+//
+// 为什么是可选的第二个接口而不是给 LeaseStore 加方法：LeaseStore 是公开契约，
+// 往里加方法会**编译期打断**所有既有实现与下游复刻（包括本仓 sqllease.Store
+// 的三方言实现）。可选接口让「需要 fencing 的调用方」用类型断言取能力，
+// 「不需要的」一行代码都不动：
+//
+//	if tls, ok := store.(worker.TokenLeaseStore); ok {
+//		ok, gen, err := tls.TryAcquireWithToken(ctx, key, holder, ttl)
+//	}
+//
+// 两档容忍粒度的差别（详见 pglease 包文档）：
+//   - 用 LeaseStore 的 TryAcquire：容忍粒度 = **一个轮询间隔**。窗口内旧主
+//     可能仍在执行动作，动作必须幂等。
+//   - 用本接口取 token：容忍粒度 = **一次写事务**。动作落库带
+//     `WHERE ... AND generation <= $token`，易主后旧主的写被数据库原子拒绝。
+//
+// 实现方**必须**保证 token 单调：同一 holder 续约保持不变、易主 +1、永不回退。
+// 「每次获取都 +1」是错实现——它会让持有者在正常续约时作废自己刚排队的写。
+type TokenLeaseStore interface {
+	// TryAcquireWithToken 原子获取或续约并返回 fencing token。
+	// 没抢到 → (false, 0, nil)（token 无意义，不是错误）。
+	// 校验口径与 TryAcquire 一致：空 key/holder、非正 ttl 一律报错。
+	TryAcquireWithToken(ctx context.Context, key, holder string, ttl time.Duration) (bool, int64, error)
+}
+
 // LeaderElector 租约选主器：周期 TryAcquire 竞争，IsLeader 反映最近一次结果，
 // 角色翻转时触发 onGained/onLost 回调。
 type LeaderElector struct {
