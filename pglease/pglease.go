@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"regexp"
 	"time"
+	"unicode/utf8"
 )
 
 // DefaultTable 缺省租约表名。
@@ -24,6 +25,11 @@ var (
 	ErrEmptyHolder = errors.New("pglease: holder 不能为空")
 	// ErrInvalidTTL 非正 ttl（queue#35）。
 	ErrInvalidTTL = errors.New("pglease: ttl 必须 > 0")
+	// ErrKeyTooLong / ErrHolderTooLong 超过 Migrate 的列宽上限（queue#34）。
+	// 单独成哨兵是为了让调用方能用 errors.Is 判定「这是配置问题不是存储故障」——
+	// 超长值到 DB 那层报的是 driver 通用错误，读不出是哪个参数、上限多少。
+	ErrKeyTooLong    = errors.New("pglease: key 超长（上限 64 字符）")
+	ErrHolderTooLong = errors.New("pglease: holder 超长（上限 128 字符）")
 )
 
 // validateIdentity 在拼 SQL 之前拦空身份：校验必须发生在**条件命中之前**，
@@ -40,12 +46,31 @@ func validateTTL(ttl time.Duration) error {
 	return nil
 }
 
+// 列宽上限，与 Migrate 的 DDL 逐字对应（queue#34）。
+//
+// ⚠️ PostgreSQL 的 VARCHAR(n) 按**字符**计而非字节，所以判据取 rune 数：
+// 逐字节判会把 30 个汉字（30 字符 / 90 字节）误拒成超限——那种错误比不校验
+// 更难查，因为它把合法输入拦在了本地。
+const (
+	MaxKeyLen    = 64
+	MaxHolderLen = 128
+)
+
 func validateIdentity(key, holder string) error {
 	if key == "" {
 		return ErrEmptyKey
 	}
 	if holder == "" {
 		return ErrEmptyHolder
+	}
+	// 长度校验同样必须在触库之前（queue#34）：超长值在 DB 层报的是
+	// `value too long for type character varying(64)`，调用方拿不到
+	// 「哪个参数超限、上限是多少」——配置写错却表现为存储故障。
+	if n := utf8.RuneCountInString(key); n > MaxKeyLen {
+		return fmt.Errorf("%w: 实得 %d 字符", ErrKeyTooLong, n)
+	}
+	if n := utf8.RuneCountInString(holder); n > MaxHolderLen {
+		return fmt.Errorf("%w: 实得 %d 字符", ErrHolderTooLong, n)
 	}
 	return nil
 }
