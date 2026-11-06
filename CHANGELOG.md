@@ -2,6 +2,64 @@
 
 > 本文件由 `matrix-tools/scripts/gen_changelogs.py` 从 git 历史生成，按 tag 切段、取每段内的 conventional commit 渲染。
 
+## [v0.9.0] — 2026-11-07
+
+### 新增(pglease)：fencing token——易主后旧主的写由数据库原子拒绝，不再靠轮询间隔容忍（#39）
+
+## 根因
+租约只保证「同一时刻至多一个 winner」，**不保证 winner 知道自己已经输了**：
+租约过期被别的副本接管后，旧持有者在下一次 `TryAcquire` 之前一直以为自己是主。
+这个窗口是租约语义的固有形态（`worker.LeaderElector` 头注释限定为「≤一个轮询
+间隔」），过去唯一的应对是**要求动作幂等**——而这把责任推给了每一个调用方，
+且**没有可验证的判据**：动作到底幂等不幂等，只有出事那天才知道。
+非幂等动作在窗口里的失效形态很具体：计数被累加两次、通知被重发、外部系统的
+状态被旧主的迟到写覆盖。这些都不是「重复执行无害」，而是数据错误。
+## 修法
+新增**单调 fencing token**，把容忍粒度从「一个轮询间隔」压到「一次写事务」：
+- `(*PGLeaseStore).TryAcquireWithToken(ctx, key, holder, ttl) (bool, int64, error)`
+  ——与 `TryAcquire` 同一条 UPSERT，多一个 `RETURNING generation`；
+- token 语义：首次插入 = 1；**同一 holder 续约保持不变**；**易主 +1**，永不回退；
+- `Migrate` 改两步：建表（新库直接带 `generation` 列）+ `ALTER TABLE ... ADD
+  COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 1`（存量库补列，幂等）；
+- `worker.TokenLeaseStore` 是**可选**接口：不给 `LeaseStore` 加方法，避免编译期
+  打断所有既有实现（含 `sqllease.Store` 三方言）。需要者用类型断言取能力。
+### 为什么「易主才 +1」，不是「每次获取都 +1」
+每次 +1 会让持有者在**正常续约**时作废自己刚排队的写（续约与写并发是极常见的
+时序），把 fencing 退化成「随机丢写」。而「权没换，token 就不该换」恰好就是它
+要表达的语义。
+### 为什么是「一条语句」而不是「先查再写」
+`RETURNING` + `ON CONFLICT` 让「是否抢到」与「拿到哪个 token」成为**同一次原子
+操作**的产物。拆两条语句时，两者之间可以插进另一个写者——调用方拿到的是**别人
+的** token，却以为自己持有它。那比没有 token 更坏：它给了一个看起来可信的 CAS
+依据。
+### 消费形态取 `generation <= $token`，不是 `=`
+业务行上存「最后一次被接受的写的 token」。`=` 只适用于「每个任期重建的业务行」，
+真实表是长期存活的，新主接手时行上还是旧 token ⇒ `=` 会把**新主的首写一并拒掉**
+（真库实测 0 行，见下反向验证第 6 条）。`<=` 让同一持有者反复写、严格更旧的
+token 恒被拒；代价是「新主接管后首写之前」旧主的写仍可能落地，由「接管后立即
+写一次」关闭。
+## 兼容性
+`TryAcquire` / `Release` / `Cleanup` / `LeaseStore` **逐字未变**，既有调用方零改动。
+新增能力全部走新符号（新方法 + 新可选接口 + 新列）。
+## 反向验证（6 条，均实测红）
+| 注入 | 报错 |
+|---|---|
+| 易主支不 `+1`（token 永不变化，CAS 恒成立） | `易主支必须 +1，否则 token 从不变化、CAS 永远成立` |
+| 续约支也 `+1`（作废自己在飞的写） | `续约支不得 +1——那会让持有者作废自己刚排队的写` |
+| token 拆成两条语句（先 `SELECT` 再 UPSERT） | `获取与取 token 必须是同一条语句，实得 2 条` |
+| 去掉触库前校验（空 key/holder 发到库里） | `err = <nil>, want pglease: key 不能为空` |
+| `Migrate` 只建表不补列（存量库补不上列） | `Migrate 应发两条语句（建表 + 补列），实得 1 条` |
+| 消费形态退回 `generation = $token`（真库） | `新 token 2 应写得进去，实得 0 行` |
+前五条在 `pglease/fencing_token_test.go`（stub driver，钉语句形态与分支结构），
+第六条在 `pglease/pglease_integration_test.go`（DSN 门控，真库）。
+### 真库用例是成对的
+`TestIntegrationFencingTokenMonotonic` 先让持权者用**当前** token 写成功
+（control），再在易主后断言同一调用被拒（treatment）——只看「0 行」无法区分
+「fencing 生效」与「CAS 形态本身就不成立」。
+## 落地范围
+`pglease` 是唯一随仓提供的 `LeaseStore` 实现（另有 `sqllease` 三方言，本次未接入
+token——它的表结构不归本版管）。宿主若要 fencing，实现 `TokenLeaseStore` 即可。
+
 ## [v0.8.0] — 2026-11-07
 
 ### 修复(pglease)：补 Cleanup 清理过期租约行——崩溃残留的行不再永久占着主键（#33）
