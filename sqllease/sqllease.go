@@ -69,6 +69,21 @@ func (s *Store) WithTable(name string) *Store {
 	return s
 }
 
+// ident 按方言引用标识符。
+//
+// MySQL 的反引号不只是风格：`key` 是 MySQL **保留字**，裸用在建表
+// （`key VARCHAR(64) PRIMARY KEY`）与 UPDATE/DELETE（`WHERE key = ?`）里
+// 直接语法错误——`sqllease` 的 MySQL 分支因此整条不可用，而三方言测试矩阵
+// 只覆盖 SQLite（SQLite 不把 key 当保留字，裸用照样跑），缺陷一路静默
+// （oagentkit/queue#32）。Postgres/SQLite 用标准双引号；SQLite 两种都接受，
+// 标准形态优先。
+func (s *Store) ident(name string) string {
+	if s.dialect == MySQL {
+		return "`" + name + "`"
+	}
+	return `"` + name + `"`
+}
+
 // ph 方言占位符（PG 用 $N，其余 ?）。
 func (s *Store) ph(i int) string {
 	if s.dialect == Postgres {
@@ -90,13 +105,14 @@ func (s *Store) nowPlus(phTTL string) string {
 }
 
 func (s *Store) nowCmp() string {
+	col := s.ident("expires_at")
 	switch s.dialect {
 	case Postgres:
-		return "expires_at < now()"
+		return col + " < now()"
 	case MySQL:
-		return "expires_at < NOW()"
+		return col + " < NOW()"
 	default:
-		return "expires_at < strftime('%s','now')"
+		return col + " < strftime('%s','now')"
 	}
 }
 
@@ -131,9 +147,10 @@ func (s *Store) TryAcquire(ctx context.Context, key, holder string, ttl time.Dur
 // conditionalAcquire 条件 UPDATE：WHERE 挂「本人持有或已过期」，命中即占用
 // 或顺延。单语句完成「判-占-续」，无查后写竞窗。
 func (s *Store) conditionalAcquire(ctx context.Context, key, holder string, ttl time.Duration) (int64, error) {
-	q := fmt.Sprintf(`UPDATE %s SET holder = %s, expires_at = %s
-WHERE key = %s AND (holder = %s OR %s)`,
-		s.table, s.ph(1), s.nowPlus(s.ph(2)), s.ph(3), s.ph(4), s.nowCmp())
+	q := fmt.Sprintf(`UPDATE %s SET %s = %s, %s = %s
+WHERE %s = %s AND (%s = %s OR %s)`,
+		s.ident(s.table), s.ident("holder"), s.ph(1), s.ident("expires_at"), s.nowPlus(s.ph(2)),
+		s.ident("key"), s.ph(3), s.ident("holder"), s.ph(4), s.nowCmp())
 	res, err := s.db.ExecContext(ctx, q, holder, ttl.Seconds(), key, holder)
 	if err != nil {
 		return 0, err
@@ -142,8 +159,9 @@ WHERE key = %s AND (holder = %s OR %s)`,
 }
 
 func (s *Store) insert(ctx context.Context, key, holder string, ttl time.Duration) error {
-	q := fmt.Sprintf(`INSERT INTO %s (key, holder, expires_at) VALUES (%s, %s, %s)`,
-		s.table, s.ph(1), s.ph(2), s.nowPlus(s.ph(3)))
+	q := fmt.Sprintf(`INSERT INTO %s (%s, %s, %s) VALUES (%s, %s, %s)`,
+		s.ident(s.table), s.ident("key"), s.ident("holder"), s.ident("expires_at"),
+		s.ph(1), s.ph(2), s.nowPlus(s.ph(3)))
 	_, err := s.db.ExecContext(ctx, q, key, holder, ttl.Seconds())
 	return err
 }
@@ -155,7 +173,8 @@ func (s *Store) Release(ctx context.Context, key, holder string) error {
 	if err := validateIdentity(key, holder); err != nil {
 		return err
 	}
-	q := fmt.Sprintf(`DELETE FROM %s WHERE key = %s AND holder = %s`, s.table, s.ph(1), s.ph(2))
+	q := fmt.Sprintf(`DELETE FROM %s WHERE %s = %s AND %s = %s`,
+		s.ident(s.table), s.ident("key"), s.ph(1), s.ident("holder"), s.ph(2))
 	_, err := s.db.ExecContext(ctx, q, key, holder)
 	return err
 }
@@ -169,9 +188,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 	}[s.dialect]
 	_, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
-  key        VARCHAR(64) PRIMARY KEY,
-  holder     VARCHAR(128) NOT NULL,
-  expires_at %s NOT NULL
-)`, s.table, typ))
+  %s VARCHAR(64) PRIMARY KEY,
+  %s VARCHAR(128) NOT NULL,
+  %s %s NOT NULL
+)`, s.ident(s.table), s.ident("key"), s.ident("holder"), s.ident("expires_at"), typ))
 	return err
 }
