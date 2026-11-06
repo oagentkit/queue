@@ -118,6 +118,16 @@ func NewLeaderElector(store LeaseStore, key, holder string, ttl, interval time.D
 	if holder == "" {
 		panic("worker: NewLeaderElector holder 不能为空——空 holder 让所有副本在租约层互相「本人持有」互认，双主无任何报错（oagentkit/queue#43）")
 	}
+	// 续约节拍必须**严格短于**租期（queue#36）：ticker 每 interval 续一次，
+	// 租约活 ttl。interval >= ttl 时租约在两次续约之间必然过期——下一次
+	// TryAcquire 之前别的副本就能拿走，而本实例的 IsLeader 仍为 true，双主
+	// 窗口由此打开，且**零报错**（两边都自认 leader，日志各自安好）。
+	//
+	// 这条与「ttl<=0 / interval<=0」是同一类构造期闸门：运行时再发现已经晚了
+	// （窗口出现在换主的那一刻，事后无法区分「正常的换主」与「双主」）。
+	if interval >= ttl {
+		panic(fmt.Sprintf("worker: NewLeaderElector interval 必须小于 ttl（ttl=%v interval=%v）——续约节拍不短于租期时，租约在两次续约之间必然过期，其他副本可在本实例仍自认 leader 时接管（双主窗口，oagentkit/queue#36）", ttl, interval))
+	}
 	e := &LeaderElector{
 		store:    store,
 		key:      key,

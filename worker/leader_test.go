@@ -231,6 +231,11 @@ func TestNewLeaderElectorRejectsInvalidParams(t *testing.T) {
 		// （`holder = ?`），空串对它恒真 ⇒ 多副本互相认作本人 ⇒ 双主零报错。
 		// holder 与 key 是一对身份，空值必是装配错误，同一道构造期闸门。
 		{"empty holder", "k", "", time.Second, time.Second, "holder"},
+		// queue#36：续约节拍必须严格短于租期。interval >= ttl 时租约在两次
+		// 续约之间必然过期 ⇒ 别的副本能在本实例仍自认 leader 时接管（双主
+		// 窗口），且两边零报错。构造期拦下，不给运行时才发现的机会。
+		{"interval==ttl", "k", "h1", time.Second, time.Second, "interval"},
+		{"interval>ttl", "k", "h1", 100 * time.Millisecond, time.Second, "interval"},
 	}
 	for _, c := range cases {
 		func() {
@@ -248,6 +253,41 @@ func TestNewLeaderElectorRejectsInvalidParams(t *testing.T) {
 	}
 	// 合法参数构造成功且 Start/Stop 正常（构造期校验不误伤）
 	e := NewLeaderElector(store, "k", "h1", time.Second, 100*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	e.Start(ctx)
+	e.Stop()
+	cancel()
+}
+
+// TestTTLIntervalRelationBoundary 关系判据的边界要精确：严格短于才合法，
+// 相等即非法（queue#36）。
+//
+// 相等是最容易被放过的形态——「interval 没超过 ttl」看起来没问题，但 ticker
+// 到位的那一刻租约刚好到期，续约与过期在同一个时刻竞争，等价于没有余量。
+func TestTTLIntervalRelationBoundary(t *testing.T) {
+	store := newMemLeaseStore()
+
+	// 相等或更长 ⇒ 构造期 panic（两种形态各钉一次：相等是最容易放过的那个）。
+	for _, c := range []struct {
+		name     string
+		ttl      time.Duration
+		interval time.Duration
+	}{
+		{"interval==ttl", time.Second, time.Second},
+		{"interval>ttl", 100 * time.Millisecond, time.Second},
+	} {
+		func() {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("%s 应构造期 panic（ttl=%v interval=%v）", c.name, c.ttl, c.interval)
+				}
+			}()
+			_ = NewLeaderElector(store, "k", "h1", c.ttl, c.interval)
+		}()
+	}
+
+	// 严格短于 ⇒ 构造成功且能跑起来（不误伤合法配置）。
+	e := NewLeaderElector(store, "k", "h1", time.Second, 999*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	e.Start(ctx)
 	e.Stop()
