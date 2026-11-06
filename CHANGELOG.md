@@ -2,6 +2,81 @@
 
 > 本文件由 `matrix-tools/scripts/gen_changelogs.py` 从 git 历史生成，按 tag 切段、取每段内的 conventional commit 渲染。
 
+## [v0.7.0] — 2026-11-06
+
+### 新增(sqllease,sqlqueue)：SQL 参考实现三方言 + LeaseStore/TaskQueue 契约硬化
+
+* feat(sqllease,sqlqueue): SQL 参考实现三方言 + LeaseStore/TaskQueue 契约硬化（#24 #25 #26）
+queue#26——时钟语义契约 + 参考实现进默认路径：
+- worker.LeaseStore doc 补 ⚠️ 时钟语义红线：expires 写入与过期判定必须同钟
+  （DB 时钟），应用时钟漂移等量放大/缩短租约时长的隐蔽失效形态写明
+  （pglease v0.10.29 修复，下游按旧形态复制的 LeaseStore 会静默丢掉）
+- worker re-export pglease（PGLeaseStore 别名 + NewPGLeaseStore）：「实现
+  接口」不再是默认路径；pglease 测试改外部包断言接口（避免成环）
+queue#24——sqllease 参考实现（database/sql，PostgreSQL/MySQL/SQLite）：
+- 判-占-续单语句条件 UPDATE（无查后写竞窗）+ DB 时钟 + INSERT 冲突降噪
+  （竞态抢先 INSERT 是预期路径，错误不外露，静默回退条件 UPDATE——argus
+  双副本 duplicate-key 红字刷屏的降噪诉求）
+- 五语义点 + 并发单 winner（-race 16 goroutine）+ 冷启动并发首抢收敛钉子
+queue#25——sqlqueue 参考实现 + TaskQueue 时序约束契约：
+- 候选 SELECT 只是提示，状态迁移在单语句守卫 UPDATE（WHERE status='pending'）
+  里完成——并发双抢恰一 winner（-race 钉子）；多任务并发分发总量守恒
+- 心跳按 runner_id 批量续期；失联判定 DB 时钟；Enqueue 宿主便利入口
+- TaskQueue doc 补时序约束段落：T_heartbeat ≪ staleAfter 量化建议（≥5×，
+  argus 90s/10s 在役配比）、排水窗口心跳续期承诺（hbCtx 独立设计意图）、
+  staleAfter 与任务执行时长约束
+测试依赖 modernc.org/sqlite（纯 Go 无 CGO，钉 v1.34.5 防 go 指令被顶起；
+lib/pq 测试依赖同款纪律，生产代码零新增依赖）；AGENTS.md / README 包表更新。
+全仓 go build / vet / -race -count=1 绿（pglease worker sqllease sqlqueue 四包）。
+关联 oagentkit/queue#24 oagentkit/queue#25 oagentkit/queue#26
+* style(worker): gofmt 对齐 LeaseStore doc
+* fix(lint): cleanup 里 db.Close 走显式忽略；删 sqlqueue 未用的 nowPlus（golangci errcheck/unused）
+---------
+Co-authored-by: Murphy-Yi <zhangyi@Murphy-YideMac-Mini.local>
+
+### 修复(worker)：NewLeaderElector 构造期参数校验——ttl/interval 非正与空 key fail-fast（#27）
+
+interval<=0 此前在后台竞选 goroutine 的 time.NewTicker 处运行时 panic——
+进程直接被炸，调用方毫无拦截机会（启动后才炸的延迟 panic，不是构造期
+fail-fast）。构造期校验 ttl>0 / interval>0 / key 非空（panic 对齐本仓
+fail-fast 哲学，但发生在装配期——参数来自配置文件的宿主装配即得反馈）。
+TestNewLeaderElectorRejectsInvalidParams：三非法参数逐点钉子 + 合法参数
+Start/Stop 不误伤。
+关联 oagentkit/queue#27
+Co-authored-by: Murphy-Yi <zhangyi@Murphy-YideMac-Mini.local>
+
+- 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.25.1
+
+| 依赖 | 现地板 | 抬到 |
+|---|---|---|
+| `github.com/oekit/concurrency` | `v0.24.0` | `v0.25.1` |
+| `github.com/oekit/logx` | `v0.8.2` | `v0.8.3` |
+## 为什么
+矩阵的**发版时刻地板时效**门禁（`verify_tag_floor --ref HEAD`）要求：各仓 HEAD
+（= 下次发版会发出去的内容）的依赖地板，相对那一刻的依赖最新版本，不能已落后。
+oekit 基座与矩阵模块都在高频发版 ⇒ 地板是**跑步机**，落后一格就会判红。
+## 兼容性实测
+本工具在提交前跑完 `go build` / `go vet` / `go test -race -count=1 ./...`（全绿才提交）
+与 `go mod tidy -diff`（无漂移）⇒ 改动**只影响依赖版本**，零行为差异。
+只改 `go.mod` / `go.sum` ⇒ 不需要 CHANGELOG 条目（版本段由下次发版的 `prewrite` 生成）。
+Co-authored-by: Murphy-Yi <zhangyi@Murphy-YideMac-Mini.local>
+
+- 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.24.0
+
+| 依赖 | 现地板 | 抬到 |
+|---|---|---|
+| `github.com/oekit/concurrency` | `v0.23.3` | `v0.24.0` |
+## 为什么
+矩阵的**发版时刻地板时效**门禁（`verify_tag_floor --ref HEAD`）要求：各仓 HEAD
+（= 下次发版会发出去的内容）的依赖地板，相对那一刻的依赖最新版本，不能已落后。
+oekit 基座与矩阵模块都在高频发版 ⇒ 地板是**跑步机**，落后一格就会判红。
+## 兼容性实测
+本工具在提交前跑完 `go build` / `go vet` / `go test -race -count=1 ./...`（全绿才提交）
+与 `go mod tidy -diff`（无漂移）⇒ 改动**只影响依赖版本**，零行为差异。
+只改 `go.mod` / `go.sum` ⇒ 不需要 CHANGELOG 条目（版本段由下次发版的 `prewrite` 生成）。
+Co-authored-by: Murphy-Yi <zhangyi@Murphy-YideMac-Mini.local>
+
+
 ## [v0.6.6] — 2026-11-04
 
 ### 重构(worker)：panic 收编收口 async.Runner、心跳循环收编 loop.Run
