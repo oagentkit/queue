@@ -19,10 +19,23 @@ const DefaultTable = "agentkit_lease"
 var (
 	ErrEmptyKey    = errors.New("sqllease: key 不能为空")
 	ErrEmptyHolder = errors.New("sqllease: holder 不能为空")
+	// ErrInvalidTTL 非正 ttl（queue#35）。
+	ErrInvalidTTL = errors.New("sqllease: ttl 必须 > 0")
 )
 
 // validateIdentity 在拼 SQL 之前拦空身份：校验必须发生在**条件命中之前**，
 // 否则空 holder 已经匹配到 `holder = ”` 的行（正是 queue#43 的形态）。
+// validateTTL 非正 ttl 必须在触库之前拒绝（queue#35）：`expires_at` 由 ttl 直接
+// 算出，ttl ≤ 0 时租约**落库即过期**——下一个 TryAcquire 立刻判「已过期」并可被
+// 任何副本抢走，击穿「同一时刻至多一个 leader」红线，而且看起来一切正常
+// （选举每次都「成功」，只是从来不是独占）。配置漏填是最常见的触发面。
+func validateTTL(ttl time.Duration) error {
+	if ttl <= 0 {
+		return ErrInvalidTTL
+	}
+	return nil
+}
+
 func validateIdentity(key, holder string) error {
 	if key == "" {
 		return ErrEmptyKey
@@ -105,6 +118,9 @@ func (s *Store) nowCmp() string {
 // key 或 holder 为空 → 错误（见 validateIdentity）。
 func (s *Store) TryAcquire(ctx context.Context, key, holder string, ttl time.Duration) (bool, error) {
 	if err := validateIdentity(key, holder); err != nil {
+		return false, err
+	}
+	if err := validateTTL(ttl); err != nil {
 		return false, err
 	}
 	n, err := s.conditionalAcquire(ctx, key, holder, ttl)

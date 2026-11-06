@@ -22,10 +22,24 @@ const DefaultTable = "agentkit_lease"
 var (
 	ErrEmptyKey    = errors.New("pglease: key 不能为空")
 	ErrEmptyHolder = errors.New("pglease: holder 不能为空")
+	// ErrInvalidTTL 非正 ttl（queue#35）。
+	ErrInvalidTTL = errors.New("pglease: ttl 必须 > 0")
 )
 
 // validateIdentity 在拼 SQL 之前拦空身份：校验必须发生在**条件命中之前**，
 // 否则空 holder 已经匹配到 holder=” 的行（正是 queue#43 的形态）。
+// validateTTL 非正 ttl 必须在触库之前拒绝（queue#35）：租约的 `expires_at`
+// 由 `now() + ttl` 算出，ttl ≤ 0 时落库那一刻就已过期——下一次 TryAcquire
+// 立刻判「已过期」并可被任何副本抢走，而「同一时刻至多一个 leader」正是这个
+// 包存在的理由。JSON/env 配置漏填（零值）是最常见的触发面，那种情况下
+// 报一句「ttl 必须 > 0」远比在数据库里看到一堆瞬间过期的行有用。
+func validateTTL(ttl time.Duration) error {
+	if ttl <= 0 {
+		return ErrInvalidTTL
+	}
+	return nil
+}
+
 func validateIdentity(key, holder string) error {
 	if key == "" {
 		return ErrEmptyKey
@@ -66,6 +80,9 @@ func (s *PGLeaseStore) WithTable(name string) *PGLeaseStore {
 // ≤ttl 换主」的承诺（v0.10.29 审计修复）。
 func (s *PGLeaseStore) TryAcquire(ctx context.Context, key, holder string, ttl time.Duration) (bool, error) {
 	if err := validateIdentity(key, holder); err != nil {
+		return false, err
+	}
+	if err := validateTTL(ttl); err != nil {
 		return false, err
 	}
 	res, err := s.db.ExecContext(ctx, fmt.Sprintf(`
