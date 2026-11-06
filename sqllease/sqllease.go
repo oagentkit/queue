@@ -3,6 +3,7 @@ package sqllease
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"regexp"
 	"time"
@@ -10,6 +11,27 @@ import (
 
 // DefaultTable 缺省租约表名。
 const DefaultTable = "agentkit_lease"
+
+// 空身份错误（queue#43）。key 与 holder 是租约的两半身份：key 指「哪把锁」，
+// holder 指「谁在持」。空值不是「没指定」而是**所有调用方共用同一个身份**——
+// 条件 UPDATE 的「本人持有则顺延」是内容比对（`holder = ?`），空串对它恒真
+// ⇒ 多副本同时自认 leader，而选举语义零报错。
+var (
+	ErrEmptyKey    = errors.New("sqllease: key 不能为空")
+	ErrEmptyHolder = errors.New("sqllease: holder 不能为空")
+)
+
+// validateIdentity 在拼 SQL 之前拦空身份：校验必须发生在**条件命中之前**，
+// 否则空 holder 已经匹配到 `holder = ”` 的行（正是 queue#43 的形态）。
+func validateIdentity(key, holder string) error {
+	if key == "" {
+		return ErrEmptyKey
+	}
+	if holder == "" {
+		return ErrEmptyHolder
+	}
+	return nil
+}
 
 // tableIdentRe 表名安全白名单：合法 SQL 标识符（防拼接注入，pglease 同款）。
 var tableIdentRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -80,7 +102,11 @@ func (s *Store) nowCmp() string {
 
 // TryAcquire 原子获取或续约租约（worker.LeaseStore 实现）。
 // 空闲/已过期/持有者就是 holder → true；他人持有未过期 → false。
+// key 或 holder 为空 → 错误（见 validateIdentity）。
 func (s *Store) TryAcquire(ctx context.Context, key, holder string, ttl time.Duration) (bool, error) {
+	if err := validateIdentity(key, holder); err != nil {
+		return false, err
+	}
 	n, err := s.conditionalAcquire(ctx, key, holder, ttl)
 	if err != nil {
 		return false, err
@@ -123,7 +149,12 @@ func (s *Store) insert(ctx context.Context, key, holder string, ttl time.Duratio
 }
 
 // Release 仅持有者本人可释放（优雅停机让位）；非持有者/key 不存在 no-op。
+// key 或 holder 为空 → 错误：空 holder 的 DELETE 会删掉 `holder = ”` 那把锁，
+// 而调用方给不出「本人」的证据（见 validateIdentity）。
 func (s *Store) Release(ctx context.Context, key, holder string) error {
+	if err := validateIdentity(key, holder); err != nil {
+		return err
+	}
 	q := fmt.Sprintf(`DELETE FROM %s WHERE key = %s AND holder = %s`, s.table, s.ph(1), s.ph(2))
 	_, err := s.db.ExecContext(ctx, q, key, holder)
 	return err

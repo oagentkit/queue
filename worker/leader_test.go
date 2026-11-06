@@ -219,13 +219,18 @@ func TestNewLeaderElectorRejectsInvalidParams(t *testing.T) {
 	cases := []struct {
 		name      string
 		key       string
+		holder    string
 		ttl       time.Duration
 		interval  time.Duration
 		wantPanic string
 	}{
-		{"ttl<=0", "k", -time.Second, time.Second, "ttl"},
-		{"interval<=0", "k", time.Second, 0, "interval"},
-		{"empty key", "", time.Second, time.Second, "key"},
+		{"ttl<=0", "k", "h1", -time.Second, time.Second, "ttl"},
+		{"interval<=0", "k", "h1", time.Second, 0, "interval"},
+		{"empty key", "", "h1", time.Second, time.Second, "key"},
+		// queue#43：空 holder 下租约实现的「本人持有则顺延」是内容比对
+		// （`holder = ?`），空串对它恒真 ⇒ 多副本互相认作本人 ⇒ 双主零报错。
+		// holder 与 key 是一对身份，空值必是装配错误，同一道构造期闸门。
+		{"empty holder", "k", "", time.Second, time.Second, "holder"},
 	}
 	for _, c := range cases {
 		func() {
@@ -238,7 +243,7 @@ func TestNewLeaderElectorRejectsInvalidParams(t *testing.T) {
 					t.Fatalf("%s: panic 应指向 %s: %v", c.name, c.wantPanic, r)
 				}
 			}()
-			_ = NewLeaderElector(store, c.key, "h1", c.ttl, c.interval)
+			_ = NewLeaderElector(store, c.key, c.holder, c.ttl, c.interval)
 		}()
 	}
 	// 合法参数构造成功且 Start/Stop 正常（构造期校验不误伤）
