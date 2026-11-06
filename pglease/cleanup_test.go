@@ -35,16 +35,6 @@ type recordedStmt struct {
 
 func (d *recordingDriver) Open(string) (driver.Conn, error) { return &recordingConn{d: d}, nil }
 
-func (d *recordingDriver) record(q string, args []driver.NamedValue) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	vals := make([]driver.Value, 0, len(args))
-	for _, a := range args {
-		vals = append(vals, a.Value)
-	}
-	d.stmts = append(d.stmts, recordedStmt{query: q, args: vals})
-}
-
 func (d *recordingDriver) queries() []recordedStmt {
 	d.mu.Lock()
 	defer d.mu.Unlock()
