@@ -212,3 +212,50 @@ func TestEmptyIdentityRejected(t *testing.T) {
 		t.Fatalf("合法 Release: %v", err)
 	}
 }
+
+// TestNonPositiveTTLRejected 非正 ttl 必须在触库之前拒绝（queue#35）。
+//
+// 失效形态：`expires_at` 由 ttl 算出，ttl ≤ 0 时租约**落库即过期**——下一次
+// TryAcquire 立刻判「已过期」并可被任何副本抢走，而「同一时刻至多一个 leader」
+// 正是这个包存在的理由；而且失效是全静默的（每次都「获取成功」，从不独占）。
+func TestNonPositiveTTLRejected(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	for _, ttl := range []time.Duration{0, -time.Second, -time.Hour} {
+		ok, err := s.TryAcquire(ctx, "lead", "a", ttl)
+		if !errors.Is(err, ErrInvalidTTL) {
+			t.Fatalf("ttl=%v 应返回 ErrInvalidTTL，得到 ok=%v err=%v", ttl, ok, err)
+		}
+		if ok {
+			t.Fatalf("ttl=%v 不得被判定为获取成功", ttl)
+		}
+	}
+
+	// 负 ttl 被拒后不得留下任何行——校验必须发生在写库之前。
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+DefaultTable).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("被拒的 TryAcquire 不该写库，实得 %d 行", count)
+	}
+}
+
+// TestNonPositiveTTLDoesNotBreakPositive 成对对照：正 ttl 照常工作。
+func TestNonPositiveTTLDoesNotBreakPositive(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	ok, err := s.TryAcquire(ctx, "lead", "a", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("正 ttl 应获取成功: ok=%v err=%v", ok, err)
+	}
+	ok, err = s.TryAcquire(ctx, "lead", "b", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("他人持有期间不得获取成功（双主）")
+	}
+}
