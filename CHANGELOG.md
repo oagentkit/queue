@@ -4,6 +4,16 @@
 
 ## [v0.10.1] — 2026-11-08
 
+### 修复(worker)：适配 concurrency v0.28.2 PanicHandler 新签名 (ctx, r, stack)——地板同步追平
+
+- oekit/concurrency v0.28.2 是 BREAKING：async.PanicHandler 由
+  func(reason string, stack []byte) 改为 func(ctx context.Context, r any, stack []byte)
+  （带 ctx 的 spawn 家族把调用方 ctx 透传给 handler，错误上报路径 r 为 fn 返回的 error）
+- worker/pool.go 三处站点适配：noopPanicReport / panicRunner / runTask 的 Handler
+  换新签名；panic 值由 string 改 any 后原样进结构化日志键 panic=（观测面不变）
+- 依赖地板同步追平：concurrency v0.28.2 / logx v0.8.8（matrix-tools#188 发版链）
+兼容性实测：go build / go vet / go test -race -count=1 ./... 全绿，go mod tidy -diff 无漂移
+
 - 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.28.1
 
 | 依赖 | 现地板 | 抬到 |
