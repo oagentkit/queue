@@ -146,7 +146,7 @@ type Pool struct {
 
 func (p *Pool) logger() logx.Logger {
 	if p.Log == nil {
-		return logx.Delegating("agentkit-worker")
+		return logx.Delegating("oagentkit-worker")
 	}
 	return p.Log
 }

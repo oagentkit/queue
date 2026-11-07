@@ -164,7 +164,7 @@ func NewLeaderElector(store LeaseStore, key, holder string, ttl, interval time.D
 		holder:   holder,
 		ttl:      ttl,
 		interval: interval,
-		log:      logx.Delegating("agentkit-leader"),
+		log:      logx.Delegating("oagentkit-leader"),
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
 	}
