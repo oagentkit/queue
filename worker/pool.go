@@ -301,7 +301,7 @@ func (p *Pool) resetStale() {
 // noopPanicReport panic 汇报职责在调用方路径的站点用（claim：loop 的
 // claim_failed 日志已含 worker id 与错误文案）——Handler 置空抑制全局
 // PanicHandler 的 stderr 兜底，库形态消费方不接 SetPanicHandler 的纪律延续。
-var noopPanicReport async.PanicHandler = func(string, []byte) {}
+var noopPanicReport async.PanicHandler = func(context.Context, any, []byte) {}
 
 // panicRunner 站点专属 panic 收编（async.Runner，concurrency#12/#13 落地后
 // 回收手搓 recover）：Handler 把 panic 值与栈路由到组件 logger 的站点专属
@@ -309,8 +309,8 @@ var noopPanicReport async.PanicHandler = func(string, []byte) {}
 // panic 栈现在随日志落盘。Runner 是值类型（一个 Handler 字段），按调用点
 // 构造零成本；panic 同时收编为 *async.PanicError 返回，errors.As 可取。
 func (p *Pool) panicRunner(panicLog string) async.Runner {
-	return async.Runner{Handler: func(msg string, stack []byte) {
-		p.logger().Error(panicLog, "panic", msg, "stack", string(stack))
+	return async.Runner{Handler: func(ctx context.Context, r any, stack []byte) {
+		p.logger().Error(panicLog, "panic", r, "stack", string(stack))
 	}}
 }
 
@@ -443,9 +443,9 @@ func (p *Pool) claim(ctx context.Context) (taskID string, ok bool, err error) {
 // heartbeat_at 一直续成新鲜的，reset 永不命中（oagentkit/queue#42）。
 // 调用点在 runTracked 里，它负责把任务移出续期集。
 func (p *Pool) runTask(runCtx context.Context, id int, taskID string) {
-	err := async.Runner{Handler: func(msg string, stack []byte) {
+	err := async.Runner{Handler: func(ctx context.Context, r any, stack []byte) {
 		p.logger().Error("agentkit.worker.task_panic", "worker", id, "task", taskID,
-			"panic", msg, "stack", string(stack))
+			"panic", r, "stack", string(stack))
 	}}.RunSafeErr(func() error { return p.Run(runCtx, taskID) })
 	if err != nil {
 		var pe *async.PanicError
