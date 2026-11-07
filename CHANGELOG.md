@@ -14,6 +14,12 @@
 - 依赖地板同步追平：concurrency v0.28.2 / logx v0.8.8（matrix-tools#188 发版链）
 兼容性实测：go build / go vet / go test -race -count=1 ./... 全绿，go mod tidy -diff 无漂移
 
+- 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.28.3
+
+oekit/concurrency v0.28.3（审计二轮 bugfix：supervisor 锁内回调死锁/滑窗预占记账/
+poll 退避归零/budget 存档拷贝等）落地，地板同步追平（matrix-tools#188 发版链）。
+兼容性实测：go build / go vet / go test -race -count=1 ./... 全绿，go mod tidy -diff 无漂移。
+
 - 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.28.1
 
 | 依赖 | 现地板 | 抬到 |
