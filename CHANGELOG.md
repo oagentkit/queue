@@ -2,6 +2,12 @@
 
 > 本文件由 `matrix-tools/scripts/gen_changelogs.py` 从 git 历史生成，按 tag 切段、取每段内的 conventional commit 渲染。
 
+## [v0.10.3] — 2026-11-08
+
+### 修复(worker,sqlqueue)：构造期闸门补齐（#71/#69）+ 毒任务重试上限与 attempts 观测面（#70）
+
+Merge branch 'main' into fix/audit-issues-71-70-69
+
 ## [v0.10.2] — 2026-11-08
 
 - 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.28.4
