@@ -8,6 +8,12 @@
 
 Merge branch 'main' into fix/audit-issues-71-70-69
 
+- 杂务(deps)：依赖地板追到最新——pkg v0.37.6 / concurrency v0.29.0 / logx v0.8.11（按本仓依赖取齐）
+
+发版时刻地板时效门禁要求追平。concurrency v0.29.0 为纯新增（四原语 feat），无 API 变更。
+兼容性实测：go build / go vet / go test -race -count=1 ./... 全绿，go mod tidy -diff 无漂移。
+
+
 ## [v0.10.2] — 2026-11-08
 
 - 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.28.4
