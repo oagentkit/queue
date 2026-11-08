@@ -81,6 +81,31 @@ type TokenLeaseStore interface {
 	TryAcquireWithToken(ctx context.Context, key, holder string, ttl time.Duration) (bool, int64, error)
 }
 
+// LeaseCleaner 是 LeaseStore 的**可选**运维能力（类型断言探测，不改
+// LeaseStore 接口本身，与 TokenLeaseStore 同一道兼容性纪律，oagentkit/queue#84）：
+// 删除已过期的租约行，返回删除行数。
+//
+// 租约行只有两种离开方式：持有者显式 Release，或被 Cleanup 清掉。缺了后者，
+// 进程崩溃留下的行会永久占着主键——动态 key（按任务/租户拼 key）场景下表
+// 只增不减（queue#33）。清理判据必须走 **DB 时钟**且与过期判定同钟（自实现
+// 者红线，见 sqllease.Store.Cleanup 与 ExpiredPredicate 的文档），不得绑应用
+// 时钟 cutoff——那会让时钟偏慢的副本删掉还活着的租约，双主窗口凭空打开。
+//
+// 宿主侧统一入口（不关心具体实现时）：
+//
+//	if lc, ok := store.(worker.LeaseCleaner); ok {
+//		n, err := lc.Cleanup(ctx) // 随心跳/定时任务周期性调用
+//	}
+//
+// 参考实现：sqllease.Store（三方言判据同源 ExpiredPredicate）与
+// pglease.PGLeaseStore（now()）。
+type LeaseCleaner interface {
+	// Cleanup 删除已过期的租约行，返回删除行数。判定必须用 DB 时钟（与
+	// TryAcquire 的过期判定同钟），且为严格小于（`<`）——`<=` 会删掉边界上
+	// 活着的租约。
+	Cleanup(ctx context.Context) (int64, error)
+}
+
 // LeaderElector 租约选主器：周期 TryAcquire 竞争，IsLeader 反映最近一次结果，
 // 角色翻转时触发 onGained/onLost 回调。
 type LeaderElector struct {
