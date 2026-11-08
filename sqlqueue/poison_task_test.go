@@ -56,6 +56,10 @@ func attemptsOf(t *testing.T, ctx context.Context, s *Store, taskID string) int 
 
 // WithMaxAttempts：毒任务在有限轮内进入终态 dead_letter，从此退出重试循环
 // （claim 只取 pending，死信行永不再被领取）。
+//
+// 次数语义（queue#86）：WithMaxAttempts(4) = 恰好执行 4 次。attempts 计数口径
+// 是 claim 与 reset 各 +1，复位时点已执行 k 次 ⟺ attempts = 2k-1；终态判据
+// attempts ≥ 2n-1。
 func TestMaxAttemptsDeadLettersPoisonTask(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t, "runner-a").WithMaxAttempts(4)
@@ -63,26 +67,33 @@ func TestMaxAttemptsDeadLettersPoisonTask(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 第 1 轮：claim(attempts=1) → 复位时 attempts=1 < 4 → 回 pending（attempts=2）
+	// 第 1 轮：claim(attempts=1，已执行 1 次) → 复位时 1 < 4 次 → 回 pending（attempts=2）
 	if !poisonCycle(t, ctx, s, "poison") {
 		t.Fatal("第 1 轮应领到 poison")
 	}
 	if st := statusOf(t, ctx, s, "poison"); st != StatusPending {
-		t.Fatalf("attempts=1 未达上限，应回 pending: %s", st)
+		t.Fatalf("已执行 1 次（<4），应回 pending: %s", st)
 	}
-	// 第 2 轮：claim(attempts=3) → 复位时 attempts=3 < 4 → 回 pending（attempts=4）
+	// 第 2 轮：claim(attempts=3，已执行 2 次) → 回 pending（attempts=4）
 	if !poisonCycle(t, ctx, s, "poison") {
 		t.Fatal("第 2 轮应领到 poison")
 	}
 	if st := statusOf(t, ctx, s, "poison"); st != StatusPending {
-		t.Fatalf("attempts=3 未达上限，应回 pending: %s", st)
+		t.Fatalf("已执行 2 次（<4），应回 pending: %s", st)
 	}
-	// 第 3 轮：claim(attempts=5) → 复位时 attempts=5 ≥ 4 → 终态 dead_letter
+	// 第 3 轮：claim(attempts=5，已执行 3 次) → 回 pending（attempts=6）
 	if !poisonCycle(t, ctx, s, "poison") {
 		t.Fatal("第 3 轮应领到 poison")
 	}
+	if st := statusOf(t, ctx, s, "poison"); st != StatusPending {
+		t.Fatalf("已执行 3 次（<4），应回 pending: %s", st)
+	}
+	// 第 4 轮：claim(attempts=7，已执行 4 次) → 复位时 4 ≥ 4 → 终态 dead_letter
+	if !poisonCycle(t, ctx, s, "poison") {
+		t.Fatal("第 4 轮应领到 poison")
+	}
 	if st := statusOf(t, ctx, s, "poison"); st != StatusDeadLetter {
-		t.Fatalf("attempts=5 ≥ 上限 4，应置终态 dead_letter: %s", st)
+		t.Fatalf("已执行满 4 次，应置终态 dead_letter: %s", st)
 	}
 	frozen := attemptsOf(t, ctx, s, "poison")
 

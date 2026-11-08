@@ -19,16 +19,20 @@
 //   - 方言分叉：SQLite 单写模型无需 SKIP LOCKED；MySQL/PG 高并发场景宿主
 //     可按需切 FOR UPDATE SKIP LOCKED 形态——本参考实现以可移植为先。
 //
-// # 毒任务：重试上限与死信终态（oagentkit/queue#70）
+// # 毒任务：重试上限与死信终态（oagentkit/queue#70；次数语义 queue#86）
 //
 // attempts 计数器沿用既有口径：每次 ClaimNextPending 与每次失联复位各 +1
 // （TaskQueue 三方法面拿不到它——观测缺口由 worker.DetailedClaimer 可选接口
 // 补上，领取侧直接拿计数）。不设上限时毒任务（Run 恒 panic/报错的任务）会
 // 永远循环：claim → 失败 → 心跳冻结 → staleAfter 后复位 → FIFO 又排到队首。
 //
-//   - WithMaxAttempts(n)（n>0）：失联复位时计数已到限（attempts ≥ n）的行
-//     置入**终态** StatusDeadLetter 而非 pending——毒任务在有限轮内退出循环。
-//     零值（缺省）不封顶，保持既有行为（兼容性红线，但强烈建议宿主显式设 n）；
+//   - WithMaxAttempts(n)（n>0）：n 是**真实执行次数**（queue#86）——任务至多
+//     被领取执行 n 次，第 n 次执行后失联复位即置入**终态** StatusDeadLetter
+//     而非 pending。attempts 计数口径不变（claim 与 reset 各 +1，一个完整
+//     周期消耗 2 个计数），终态判定在复位时把计数折算成执行次数
+//     （判 attempts ≥ 2n-1）——此前直接判 attempts ≥ n，实际执行次数是
+//     floor(n/2)+1，与 API 名字承诺对不上。零值（缺省）不封顶，保持既有
+//     行为（兼容性红线，但强烈建议宿主显式设 n）；
 //   - 死信面：状态 'dead_letter' 可直查（监控/告警/排查），claim 只取 pending，
 //     死信行永不再被领取、也不再被复位；库不自动重驱，人工重驱 =
 //     `UPDATE ... SET status='pending', attempts=0`；

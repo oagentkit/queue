@@ -72,8 +72,10 @@ type Store struct {
 	dialect  Dialect
 	table    string
 	runnerID string
-	// maxAttempts 重试计数上限（queue#70）：>0 时失联复位把计数已到限的行
-	// 置入终态 dead_letter 而非 pending；0（缺省）不封顶——既有行为。
+	// maxAttempts 重试上限（queue#70，语义按 queue#86 修正为真实执行次数）：
+	// n>0 时失联复位把已执行满 n 次的行置入终态 dead_letter 而非 pending；
+	// 0（缺省）不封顶——既有行为。终态判据绑定 attempts >= 2n-1（attempts 计数
+	// 口径是 claim 与 reset 各 +1，见 ResetRunningToPending 的折算说明）。
 	maxAttempts int
 }
 
@@ -113,22 +115,35 @@ func (s *Store) WithTable(name string) *Store {
 	return s
 }
 
-// WithMaxAttempts 设置重试计数上限，返回自身（链式；n<=0 = 不封顶，即缺省行为）。
+// WithMaxAttempts 设置任务重试上限，返回自身（链式；n<=0 = 不封顶，即缺省行为）。
 //
-// 契约（oagentkit/queue#70）：attempts 计数器沿用既有口径——每次 claim 与每次
-// 失联复位各 +1。n>0 时，ResetRunningToPending 复位失联 running 行时若该行
-// attempts 已 ≥ n，不再回 pending 而是置入终态 dead_letter（归属清空、计数
-// 随最后一次复位定格）——毒任务（Run 恒 panic/报错）在有限轮内退出重试循环，
-// 不再每轮烧一次 claim+run。死信面与观测：
+// 语义（oagentkit/queue#86 修正）：**n 是真实执行次数**——一个任务至多被领取
+// 执行 n 次；第 n 次执行后若心跳再次失联，ResetRunningToPending 把它置入终态
+// dead_letter（归属清空）而非 pending。WithMaxAttempts(3) 的任务恰好执行 3 次。
+//
+//   - attempts 计数口径不变（queue#70 既有契约）：每次 claim 与每次失联复位
+//     各 +1，「领取 → 失联复位」一个完整周期消耗 2 个计数。终态判定在复位时
+//     把计数**折算成执行次数**（复位时点已执行次数 = (attempts+1)/2），等价于
+//     判 `attempts >= 2n-1`——此前直接拿计数判 `attempts >= n`，实际执行次数
+//     是 floor(n/2)+1，与 API 名字承诺的「尝试次数」对不上（n=3 拿到 2 次）；
+//   - dead_letter 行的 attempts 定格在 2n（第 n 次复位的自增后），人工重驱
+//     照旧 `UPDATE ... SET status='pending', attempts=0`；
+//   - 零值（不调用本方法）不封顶，毒任务照旧无限重试——兼容性红线，本次
+//     修正不触碰缺省路径的 SQL。
+//
+// ⚠️ 副本抖动（OOM 重启/滚动发布/节点驱逐）同样消耗预算：失联复位的任务
+// 即便从未真正跑完也算「执行过一次」。staleAfter 期内频繁抖动的宿主应把 n
+// 折进抖动轮数，或监控 dead_letter 面的人工重驱频率。
+//
+// 死信面与观测（queue#70 既有）：
 //
 //   - 死信行可直查：`SELECT ... WHERE status = 'dead_letter'`（状态常量
 //     StatusDeadLetter），监控/告警/人工排查都吃这一面；
 //   - 人工重驱：`UPDATE ... SET status = 'pending', attempts = 0`；
 //   - 不想碰表内状态的宿主：实现/探测 worker.DetailedClaimer，领取侧直接
-//     拿 attempts。
+//     拿 attempts（含本次领取的计数）。
 //
-// 零值（不调用本方法）**保持既有行为**：不封顶，毒任务照旧无限重试——
-// 兼容性红线。建议宿主一律显式设 n（按 staleAfter 周期与业务可容忍重试轮数折算）。
+// 建议宿主一律显式设 n（按 staleAfter 周期与业务可容忍重试轮数折算）。
 func (s *Store) WithMaxAttempts(n int) *Store {
 	if n > 0 {
 		s.maxAttempts = n
@@ -257,22 +272,33 @@ WHERE runner_id = %s AND status = 'running' AND task_id IN (%s)`,
 // ResetRunningToPending 重置心跳已死的 running 任务（返回处理条数：回 pending
 // 与进死信的行都计入）。失联判定走 DB 时钟（heartbeat_at < now - staleAfter）。
 //
-// 重试上限（WithMaxAttempts，oagentkit/queue#70）：设了上限（>0）时，计数已到
-// 限（attempts ≥ n）的失联行不再回 pending，而是置入**终态** dead_letter——
-// 毒任务在有限轮内退出「复位→重领→再失败」循环。计数未到限的行照旧回 pending
-// 重试。零值（缺省）不封顶：全部回 pending，与既有行为逐字一致。
+// 重试上限（WithMaxAttempts，oagentkit/queue#70；判据按真实执行次数折算，
+// oagentkit/queue#86）：设了上限（n>0）时，已执行满 n 次的失联行不再回
+// pending，而是置入**终态** dead_letter——毒任务在有限轮内退出「复位→重领→
+// 再失败」循环。未满 n 次的行照旧回 pending 重试。零值（缺省）不封顶：全部
+// 回 pending，与既有行为逐字一致。
 //
-// attempts 两种落点都 +1（计数口径不变：claim 与 reset 各计一次）；dead_letter
-// 行的归属照常清空，计数随最后一次复位定格，后续 claim/reset 不再碰它。
+// 折算口径：attempts 计数是 claim 与 reset 各 +1（queue#70 既有契约），一个
+// 「领取 → 失联复位」周期消耗 2 个计数、对应 1 次真实执行——复位时点的
+// 已执行次数 = (attempts+1)/2。SQL 里判 `attempts >= 2n-1`（阈值在 Go 侧由
+// n 算出，不在 SQL 里做除法——MySQL 的 `/` 是小数除法，`(attempts+1)/2 >= n`
+// 在三方言下不等价）。此前直接判 `attempts >= n`，实际允许的执行次数是
+// floor(n/2)+1，与 WithMaxAttempts 承诺的「n 次尝试」对不上（queue#86）。
+//
+// attempts 两种落点都 +1（计数口径不变）；dead_letter 行的归属照常清空，
+// 计数随最后一次复位定格（= 2n），后续 claim/reset 不再碰它。
 func (s *Store) ResetRunningToPending(ctx context.Context, staleAfter time.Duration) (int64, error) {
 	var q string
 	var args []any
 	if s.maxAttempts > 0 {
+		// 2n-1：复位时点 attempts=2k-1 ⟺ 已执行 k 次（见上），判
+		// `attempts >= 2n-1` 即「已执行 ≥ n 次」。阈值在 Go 侧折算，
+		// SQL 判据形状与计数口径保持不变。
 		q = fmt.Sprintf(`UPDATE %s SET status = CASE WHEN attempts >= %s THEN '%s' ELSE '%s' END,
 runner_id = NULL, attempts = attempts + 1
 WHERE status = '%s' AND heartbeat_at < %s`,
 			s.table, s.ph(1), StatusDeadLetter, StatusPending, StatusRunning, s.nowMinus(s.ph(2)))
-		args = []any{s.maxAttempts, staleAfter.Seconds()}
+		args = []any{2*s.maxAttempts - 1, staleAfter.Seconds()}
 	} else {
 		q = fmt.Sprintf(`UPDATE %s SET status = '%s', runner_id = NULL, attempts = attempts + 1
 WHERE status = '%s' AND heartbeat_at < %s`,
