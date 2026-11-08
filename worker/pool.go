@@ -112,6 +112,26 @@ type ScopedHeartbeater interface {
 	TouchHeartbeatsFor(ctx context.Context, taskIDs []string) error
 }
 
+// DetailedClaimer 是 TaskQueue 的**可选加强**（类型断言探测，不改 TaskQueue
+// 接口本身——实现方在仓外，往接口里加方法是破坏性变更，与 ScopedHeartbeater
+// 同一道兼容性纪律，oagentkit/queue#70）：把领取时点的 attempts（重试计数）
+// 透出到消费侧。TaskQueue 的三方法面拿不到它，宿主要实现「毒任务闸门」
+// （重试超 N 次改走本地死信/告警）就只能直查队列内部表——接口恰好把
+// attempts 藏了起来，这正是审计 issue 指出的观测面缺口。
+//
+// Pool 在 Queue 实现本接口时改走 detailed claim，attempts 随 claimed 日志
+// 落盘（毒任务的重复领取在运维侧可见）；未实现时走原三方法路径，行为不变。
+//
+// 参考实现：sqlqueue.Store.ClaimNextPendingDetailed（attempts 含本次领取：
+// 首次领取 = 1，失联复位一轮后重领 = 3）。重试上限与死信终态见 sqlqueue 的
+// WithMaxAttempts / StatusDeadLetter。
+type DetailedClaimer interface {
+	// ClaimNextPendingDetailed 原子抢占下一个 pending 任务并返回其 attempts。
+	// 语义与 ClaimNextPending 完全一致（同一原子守卫），仅多透出计数；
+	// ok=false 时 attempts 无意义（实现方应返回 0）。
+	ClaimNextPendingDetailed(ctx context.Context) (taskID string, attempts int, ok bool, err error)
+}
+
 // Pool worker 池。
 type Pool struct {
 	Queue TaskQueue
@@ -394,7 +414,7 @@ func (p *Pool) loop(loopCtx, runCtx context.Context, id int) {
 			return
 		default:
 		}
-		taskID, ok, err := p.claim(loopCtx)
+		taskID, attempts, ok, err := p.claim(loopCtx)
 		if err != nil {
 			if loopCtx.Err() != nil {
 				return
@@ -407,7 +427,13 @@ func (p *Pool) loop(loopCtx, runCtx context.Context, id int) {
 			sleepCtx(loopCtx, 500*time.Millisecond)
 			continue
 		}
-		p.logger().Info("agentkit.worker.claimed", "worker", id, "task", taskID)
+		// attempts 仅在 Queue 实现 DetailedClaimer 时 > 0（queue#70）：
+		// 毒任务的重复领取凭这个字段在 claimed 日志里现形
+		kv := []any{"worker", id, "task", taskID}
+		if attempts > 0 {
+			kv = append(kv, "attempts", attempts)
+		}
+		p.logger().Info("agentkit.worker.claimed", kv...)
 		p.runTracked(runCtx, id, taskID)
 	}
 }
@@ -416,7 +442,10 @@ func (p *Pool) loop(loopCtx, runCtx context.Context, id int) {
 // Queue 是调用方实现（GORM 等），panic 若穿透会杀死该 worker goroutine——池
 // 静默减员（与 runTask 隔离同一不变量）。恢复后按 claim 失败路径退避重试。
 // 挂死经 ClaimTimeout 兜底。
-func (p *Pool) claim(ctx context.Context) (taskID string, ok bool, err error) {
+//
+// Queue 实现 DetailedClaimer 时改走 detailed claim（queue#70），attempts 随
+// 返回值透出（普通实现 attempts=0，行为不变）。
+func (p *Pool) claim(ctx context.Context) (taskID string, attempts int, ok bool, err error) {
 	err = async.Runner{Handler: noopPanicReport}.RunSafeErr(func() error {
 		timeout := p.ClaimTimeout
 		if timeout <= 0 {
@@ -424,14 +453,18 @@ func (p *Pool) claim(ctx context.Context) (taskID string, ok bool, err error) {
 		}
 		cctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-		taskID, ok, err = p.Queue.ClaimNextPending(cctx)
+		if dc, detailed := p.Queue.(DetailedClaimer); detailed {
+			taskID, attempts, ok, err = dc.ClaimNextPendingDetailed(cctx)
+		} else {
+			taskID, ok, err = p.Queue.ClaimNextPending(cctx)
+		}
 		return err
 	})
 	var pe *async.PanicError
 	if errors.As(err, &pe) {
 		err = fmt.Errorf("worker: queue panic: %v", pe.Value)
 	}
-	return taskID, ok, err
+	return taskID, attempts, ok, err
 }
 
 // runTask 单任务执行（panic 隔离，async.Runner 收编手搓 recover）：任务 panic

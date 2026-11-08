@@ -132,6 +132,13 @@ func WithLeaderLogger(log logx.Logger) LeaderOption {
 // 期拦截。参数来自配置文件的宿主在装配期即得到反馈，不是运行期。
 func NewLeaderElector(store LeaseStore, key, holder string, ttl, interval time.Duration,
 	opts ...LeaderOption) *LeaderElector {
+	// nil store 与非正 ttl 同一道闸门（oagentkit/queue#71）：构造期放行的
+	// nil LeaseStore 会在首个 tick 对 nil 接口调方法——panic 落在后台竞选
+	// goroutine（Start 拉起），进程直接被炸，调用方毫无拦截机会。装配期
+	// （配置驱动的 store 条件构造）最容易产出 nil，拦截点必须在构造函数。
+	if store == nil {
+		panic("worker: NewLeaderElector store 不能为 nil——nil LeaseStore 的方法调用会在后台竞选 goroutine 里 panic（oagentkit/queue#27 同型：进程直接被炸，调用方毫无拦截机会），必须在构造期拦截")
+	}
 	if ttl <= 0 {
 		panic(fmt.Sprintf("worker: NewLeaderElector ttl 必须 > 0（得到 %v）——非正 ttl 让「失联后 ≤ttl 换主」承诺失效", ttl))
 	}
