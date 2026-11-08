@@ -35,11 +35,15 @@
 //   - 消费侧闸门：宿主对 Queue 类型断言 worker.DetailedClaimer，从
 //     ClaimNextPendingDetailed 拿 attempts 自行裁决（不碰表内状态）。
 //
-// # 构造期闸门（oagentkit/queue#69）
+// # 构造期闸门与长度护栏（oagentkit/queue#69、queue#85）
 //
-// New 对 nil db 与空 runnerID 直接 panic（与 worker.NewLeaderElector 同一道
-// fail-fast 纪律）：runnerID 是**副本身份**——心跳归属（WHERE runner_id = ?）
-// 与失联复位的键，必须每实例唯一；空身份让多副本互相续命/互相复位且零报错
-// （queue#43 空身份家族、queue#42 静默丢失同型）。nil db 只会把 panic 推迟到
-// 首次用语句的后台 goroutine。
+// New 对 nil db、空 runnerID 与超长 runnerID 直接 panic（与
+// worker.NewLeaderElector 同一道 fail-fast 纪律）：runnerID 是**副本身份**——
+// 心跳归属（WHERE runner_id = ?）与失联复位的键，必须每实例唯一；空身份让
+// 多副本互相续命/互相复位且零报错（queue#43 空身份家族、queue#42 静默丢失
+// 同型）；超长 runnerID 的 DB 层报错点在首次 claim（后台守护循环），装配期
+// 反馈彻底丢失，MySQL 非 strict 下还会静默截断成他副本的身份。Enqueue 对
+// 超长 taskID 返回哨兵 ErrTaskIDTooLong（运行期入口不 panic，但同样在触库
+// 之前拦下——task_id 是主键与载荷句柄，截断/超长的结局见其 doc）。列宽由
+// MaxTaskIDLen/MaxRunnerIDLen 派生 Migrate 的 VARCHAR，护栏与 DDL 同源。
 package sqlqueue

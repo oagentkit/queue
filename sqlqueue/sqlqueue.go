@@ -3,14 +3,29 @@ package sqlqueue
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // DefaultTable 缺省任务表名。
 const DefaultTable = "agentkit_task"
+
+// 列宽上限，与 Migrate 的 DDL 由同一组常量派生（queue#85，pglease#34/
+// sqllease#83 同族）——两处各写一个数字、改一处忘另一处，本缺陷就会复现。
+//
+// task_id 是任务的主键与业务载荷的句柄：MySQL 非 strict 下超长值**静默截断**，
+// 两个语义不同的任务塌成同一条主键，或 ClaimNextPending 返回被截断的 id 让
+// 宿主查到别人的载荷；runner_id 截断后两个副本互认同一身份，心跳互相续命
+// （queue#42 形态）。⚠️ SQL 的 VARCHAR(n) 按**字符**计而非字节，判据取
+// rune 数——逐字节判会把 64 个汉字（64 字符 / 192 字节）误拒成超限。
+const (
+	MaxTaskIDLen   = 64
+	MaxRunnerIDLen = 128
+)
 
 // 任务行状态（宿主直查/监控用；done/failed 等业务终态由宿主自写，不入此列）。
 const (
@@ -27,6 +42,13 @@ const (
 // claimRetries 单轮 Claim 的竞态重试上限：候选被抢 → 换下一候选；上限内
 // 全部被抢视作本轮无任务（下轮守护循环再试）。正常负载下一两次即命中。
 const claimRetries = 8
+
+// ErrTaskIDTooLong 超过 MaxTaskIDLen（queue#85）。Enqueue 是运行期入口（有
+// error 返回，不必像 New 那样 panic），单独成哨兵是为了让调用方能用 errors.Is
+// 判定「这是配置问题不是存储故障」——超长 task_id 到 DB 那层，PG/MySQL strict
+// 报 driver 通用错误（读不出哪个参数、上限多少），MySQL 非 strict **静默截断**，
+// SQLite 原样放行，没有一种会指出「你的 taskID 太长了」。
+var ErrTaskIDTooLong = errors.New("sqlqueue: taskID 超长（上限 64 字符）")
 
 // tableIdentRe 表名安全白名单（防拼接注入，sqllease/pglease 同款）。
 var tableIdentRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -63,14 +85,22 @@ type Store struct {
 // 且全程零报错（queue#43 空身份家族）。
 //
 // 构造期 fail-fast（panic，与 worker.NewLeaderElector 同一道纪律，
-// oagentkit/queue#69）：nil db 与空 runnerID 都是装配期语义破坏——nil db
-// 只会把 panic 推迟到首次用语句的 goroutine（常在后台），空身份则静默失效。
+// oagentkit/queue#69）：nil db 与空/超长 runnerID 都是装配期语义破坏——nil db
+// 只会把 panic 推迟到首次用语句的 goroutine（常在后台），空身份则静默失效；
+// 超长 runnerID 的报错点若推迟到 DB 层会在**首次 claim**（后台守护循环里，
+// 装配期反馈彻底丢失），MySQL 非 strict 下还会静默截断成另一个副本的身份
+// （心跳互相续命，queue#42 形态，queue#85）。
 func New(db *sql.DB, dialect Dialect, runnerID string) *Store {
 	if db == nil {
 		panic("sqlqueue: New db 不能为 nil——nil *sql.DB 只会把 panic 推迟到首次用语句的 goroutine（常在后台，调用方毫无拦截机会），必须在构造期拦截")
 	}
 	if runnerID == "" {
 		panic("sqlqueue: New runnerID 不能为空——runnerID 是副本身份（心跳归属 WHERE runner_id=? 的键），空身份让多副本互相续命/互相复位且零报错（oagentkit/queue#43 同族、queue#42 静默丢失形态），必须每实例唯一")
+	}
+	// 长度闸门与空身份同一道（queue#85）：上限由 MaxRunnerIDLen 派生 Migrate
+	// 的 VARCHAR(128)，rune 口径（VARCHAR(n) 按字符计，逐字节判会误拒汉字身份）。
+	if n := utf8.RuneCountInString(runnerID); n > MaxRunnerIDLen {
+		panic(fmt.Sprintf("sqlqueue: New runnerID 超长（上限 %d 字符，实得 %d）——超长值到 DB 层报 driver 通用错误且报错点在首次 claim（后台），MySQL 非 strict 下更会静默截断成他副本的身份（oagentkit/queue#85）", MaxRunnerIDLen, n))
 	}
 	return &Store{db: db, dialect: dialect, table: DefaultTable, runnerID: runnerID}
 }
@@ -258,7 +288,16 @@ WHERE status = '%s' AND heartbeat_at < %s`,
 
 // Enqueue 追加一个 pending 任务（TaskQueue 接口外的宿主便利入口：
 // 接口只约定消费面三方法，入队由宿主直插本表——本方法是等价快捷方式）。
+//
+// 超长 taskID → ErrTaskIDTooLong（queue#85）：校验在触库之前——task_id 是
+// 主键与业务载荷的句柄，超长值交到 DB 层，PG/MySQL strict 报 driver 通用
+// 错误、MySQL 非 strict 静默截断（两个语义不同的任务塌成同一条主键，或
+// claim 返回被截断的 id 让宿主查到别人的载荷）、SQLite 原样放行。rune 口径
+// 与 Migrate 的 VARCHAR(MaxTaskIDLen) 同源。
 func (s *Store) Enqueue(ctx context.Context, taskID string) error {
+	if n := utf8.RuneCountInString(taskID); n > MaxTaskIDLen {
+		return fmt.Errorf("%w: 实得 %d 字符", ErrTaskIDTooLong, n)
+	}
 	q := fmt.Sprintf(`INSERT INTO %s (task_id, status, runner_id, heartbeat_at, created_at, attempts)
 VALUES (%s, 'pending', NULL, NULL, %s, 0)`, s.table, s.ph(1), s.nowFn())
 	_, err := s.db.ExecContext(ctx, q, taskID)
@@ -266,7 +305,8 @@ VALUES (%s, 'pending', NULL, NULL, %s, 0)`, s.table, s.ph(1), s.nowFn())
 }
 
 // Migrate 建任务表与两个索引（幂等；MySQL 无 CREATE INDEX IF NOT EXISTS，
-// 走 information_schema 判存）。
+// 走 information_schema 判存）。列宽由 MaxTaskIDLen/MaxRunnerIDLen 派生
+// （queue#85）。
 func (s *Store) Migrate(ctx context.Context) error {
 	ts := map[Dialect]string{Postgres: "TIMESTAMPTZ", MySQL: "DATETIME", SQLite: "REAL"}[s.dialect]
 	createIdx := fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_status_created ON %s (status, created_at)`, s.table, s.table)
@@ -277,13 +317,13 @@ func (s *Store) Migrate(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
-  task_id     VARCHAR(64) PRIMARY KEY,
+  task_id     VARCHAR(%d) PRIMARY KEY,
   status      VARCHAR(16) NOT NULL DEFAULT 'pending',
-  runner_id   VARCHAR(128),
+  runner_id   VARCHAR(%d),
   heartbeat_at %s,
   created_at  %s NOT NULL,
   attempts    INT NOT NULL DEFAULT 0
-)`, s.table, ts, ts)); err != nil {
+)`, s.table, MaxTaskIDLen, MaxRunnerIDLen, ts, ts)); err != nil {
 		return err
 	}
 	for _, q := range []string{createIdx, createHB} {
