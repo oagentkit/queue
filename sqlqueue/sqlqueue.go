@@ -333,13 +333,26 @@ VALUES (%s, 'pending', NULL, NULL, %s, 0)`, s.table, s.ph(1), s.nowFn())
 // Migrate 建任务表与两个索引（幂等；MySQL 无 CREATE INDEX IF NOT EXISTS，
 // 走 information_schema 判存）。列宽由 MaxTaskIDLen/MaxRunnerIDLen 派生
 // （queue#85）。
+//
+// MySQL 判存必须带 `table_schema = DATABASE()`（queue#87）：
+// information_schema.statistics 是**跨库**视图，只按 table_name + index_name
+// 判存时，同一实例上任意一个 schema 里有同名表 + 同名索引（索引名由表名派生，
+// 同名表必然同名索引——dev/staging/prod 三库并存、mysqldump 复制库、多租户
+// 每租户一 schema 都命中），本 schema 的 Migrate 就会误判「已存在」并跳过，
+// 索引**永不创建**且零报错——任务表是高频读写面，缺索引直接表现为吞吐下降
+// 与 DB CPU 上涨，排查方向会被引向「任务太多」。绑 DATABASE() 而非在语句里
+// 调用，是避开个别代理/中间件对语句内 DATABASE() 的支持差异。
 func (s *Store) Migrate(ctx context.Context) error {
 	ts := map[Dialect]string{Postgres: "TIMESTAMPTZ", MySQL: "DATETIME", SQLite: "REAL"}[s.dialect]
-	createIdx := fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_status_created ON %s (status, created_at)`, s.table, s.table)
-	createHB := fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_runner_status ON %s (runner_id, status)`, s.table, s.table)
+	// 索引名直接算出来（queue#87 顺带）：从自己刚拼的 ALTER 字符串里反解
+	// 既脆弱也无必要。
+	idxStatus := fmt.Sprintf("%s_status_created", s.table)
+	idxRunner := fmt.Sprintf("%s_runner_status", s.table)
+	createIdx := fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s (status, created_at)`, idxStatus, s.table)
+	createHB := fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s (runner_id, status)`, idxRunner, s.table)
 	if s.dialect == MySQL {
-		createIdx = fmt.Sprintf(`ALTER TABLE %s ADD INDEX %s_status_created (status, created_at)`, s.table, s.table)
-		createHB = fmt.Sprintf(`ALTER TABLE %s ADD INDEX %s_runner_status (runner_id, status)`, s.table, s.table)
+		createIdx = fmt.Sprintf(`ALTER TABLE %s ADD INDEX %s (status, created_at)`, s.table, idxStatus)
+		createHB = fmt.Sprintf(`ALTER TABLE %s ADD INDEX %s (runner_id, status)`, s.table, idxRunner)
 	}
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
@@ -352,41 +365,21 @@ CREATE TABLE IF NOT EXISTS %s (
 )`, s.table, MaxTaskIDLen, MaxRunnerIDLen, ts, ts)); err != nil {
 		return err
 	}
-	for _, q := range []string{createIdx, createHB} {
+	for _, q := range []struct{ stmt, name string }{{createIdx, idxStatus}, {createHB, idxRunner}} {
 		if s.dialect == MySQL {
 			var n int
 			if err := s.db.QueryRowContext(ctx,
-				`SELECT COUNT(*) FROM information_schema.statistics WHERE table_name = ? AND index_name = ?`,
-				s.table, indexName(q)).Scan(&n); err != nil {
+				`SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?`,
+				s.table, q.name).Scan(&n); err != nil {
 				return err
 			}
 			if n > 0 {
-				continue // 已存在，跳过
+				continue // 本 schema 已存在，跳过
 			}
 		}
-		if _, err := s.db.ExecContext(ctx, q); err != nil {
+		if _, err := s.db.ExecContext(ctx, q.stmt); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-// indexName 从 ALTER 语句里取索引名（MySQL 判存用）。
-func indexName(alter string) string {
-	// "ALTER TABLE t ADD INDEX t_runner_status (...)" → 第 4 个空格后的 token 链
-	const marker = " ADD INDEX "
-	i := len(alter) - len(marker)
-	for j := 0; j < len(alter)-len(marker); j++ {
-		if alter[j:j+len(marker)] == marker {
-			i = j + len(marker)
-			break
-		}
-	}
-	rest := alter[i:]
-	for j := 0; j < len(rest); j++ {
-		if rest[j] == ' ' || rest[j] == '(' {
-			return rest[:j]
-		}
-	}
-	return rest
 }
