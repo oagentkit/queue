@@ -190,7 +190,7 @@ func TestTryAcquireWithTokenIncrementsOnlyOnTakeover(t *testing.T) {
 	}
 
 	// 新行起点：首次插入即 1（与「易主才涨」同一把尺子——首次获取也是第一次持权）。
-	if !strings.Contains(q, "VALUES ($1, $2, now() + make_interval(secs => $3), 1)") {
+	if !strings.Contains(q, "VALUES ($1, $2, now() + make_interval(secs => $3), 1, TRUE)") {
 		t.Fatalf("首次插入的 generation 应为字面 1（不是 0、也不是 +1 表达式）: %q", q)
 	}
 }
@@ -252,31 +252,51 @@ func TestTryAcquireWithTokenValidatesBeforeTouchingDB(t *testing.T) {
 // `CREATE TABLE IF NOT EXISTS` 是 no-op ⇒ 存量部署补不上列，
 // TryAcquireWithToken 在运行期报 `column "generation" does not exist`，
 // 而 TryAcquire 照常工作——症状是「只有想用 fencing 的那条路径坏了」。
+// TestMigrateAddsGenerationColumnIdempotently Migrate 必须给**旧表**补列。
+//
+// 失效形态：只在 CREATE TABLE 里写 generation。对已存在的表
+// `CREATE TABLE IF NOT EXISTS` 是 no-op ⇒ 存量部署补不上列，
+// TryAcquireWithToken 在运行期报 `column "generation" does not exist`，
+// 而 TryAcquire 照常工作——症状是「只有想用 fencing 的那条路径坏了」。
+// fenced 列（queue#89）同款要求：旧库补不上 fenced 列时 token 路径同样
+// 运行期报错——两条补列语句都钉成幂等形态。
 func TestMigrateAddsGenerationColumnIdempotently(t *testing.T) {
 	s, d := newFencingStore(t, 0, false)
 	if err := s.Migrate(context.Background()); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
 	stmts := d.recorded()
-	if len(stmts) < 2 {
-		t.Fatalf("Migrate 应发两条语句（建表 + 补列），实得 %d 条: %v", len(stmts), stmts)
+	if len(stmts) < 3 {
+		t.Fatalf("Migrate 应发三条语句（建表 + 两条补列），实得 %d 条: %v", len(stmts), stmts)
 	}
-	var alter string
+	var alters []string
 	for _, st := range stmts {
 		if strings.HasPrefix(strings.TrimSpace(st.query), "ALTER TABLE") {
-			alter = st.query
+			alters = append(alters, st.query)
 		}
 	}
-	if alter == "" {
-		t.Fatalf("Migrate 未发 ALTER TABLE：存量表补不上 generation 列: %v", stmts)
+	if len(alters) != 2 {
+		t.Fatalf("Migrate 应发两条 ALTER TABLE（generation + fenced），实得 %d 条: %v", len(alters), alters)
 	}
-	if !strings.Contains(alter, "ADD COLUMN IF NOT EXISTS generation") {
-		t.Fatalf("补列必须是 `ADD COLUMN IF NOT EXISTS`（幂等，可反复跑）: %q", alter)
+	var hasGen, hasFenced bool
+	for _, alter := range alters {
+		if strings.Contains(alter, "ADD COLUMN IF NOT EXISTS generation") {
+			hasGen = true
+			if !strings.Contains(alter, "NOT NULL DEFAULT 1") {
+				t.Fatalf("generation 补列需 `NOT NULL DEFAULT 1`，否则存量行读出 NULL、Scan 直接失败: %q", alter)
+			}
+		}
+		if strings.Contains(alter, "ADD COLUMN IF NOT EXISTS fenced") {
+			hasFenced = true
+			if !strings.Contains(alter, "NOT NULL DEFAULT FALSE") {
+				t.Fatalf("fenced 补列需 `NOT NULL DEFAULT FALSE`：存量行是 fencing 之前的行，保持可删可清: %q", alter)
+			}
+		}
 	}
-	if !strings.Contains(alter, "NOT NULL DEFAULT 1") {
-		t.Fatalf("补列需 `NOT NULL DEFAULT 1`，否则存量行读出 NULL、Scan 直接失败: %q", alter)
+	if !hasGen || !hasFenced {
+		t.Fatalf("两条补列语句缺失（generation=%v fenced=%v）: %v", hasGen, hasFenced, alters)
 	}
-	if !strings.Contains(stmts[0].query, "generation BIGINT") {
-		t.Fatalf("新库建表也应直接带 generation 列（省一条 ALTER）: %q", stmts[0].query)
+	if !strings.Contains(stmts[0].query, "generation BIGINT") || !strings.Contains(stmts[0].query, "DEFAULT FALSE") {
+		t.Fatalf("新库建表也应直接带 generation/fenced 列（省 ALTER）: %q", stmts[0].query)
 	}
 }

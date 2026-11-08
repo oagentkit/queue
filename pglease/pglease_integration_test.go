@@ -205,3 +205,177 @@ func casWrite(t *testing.T, db *sql.DB, token int64) int64 {
 	}
 	return n
 }
+
+// TestIntegrationFencingTokenSurvivesReleaseAndCleanup fencing token 必须**跨
+// 租约行生命周期**存续（queue#89，真 PostgreSQL 实弹复现的修复回归）：
+//
+// 修复前的确定性故障：任期1 hA token=1 写业务行 → 1；过期易主 hB token=2 写 → 2；
+// hB 优雅停机（Release 删行）→ hC 合法继任得 **token=1**，对业务行（generation=2）
+// 的 fenced 写 2<=1 恒 0 行——合法新主被数据库永久拒绝，而 stale 旧 token 反而是
+// 最高有效 token（方向性反转）。Cleanup 路径同款复现。
+//
+// 修后：fenced 行 Release 置墓碑（generation 保留）、Cleanup 免删——三个任期
+// 的 token 单调递增，旧 token 恒被拒。
+func TestIntegrationFencingTokenSurvivesReleaseAndCleanup(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	db := s.db
+
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS agentkit_fence_biz89 (
+		id BIGINT PRIMARY KEY, generation BIGINT NOT NULL, payload TEXT NOT NULL DEFAULT '')`); err != nil {
+		t.Fatalf("建业务表: %v", err)
+	}
+	t.Cleanup(func() { _, _ = db.Exec("DROP TABLE IF EXISTS agentkit_fence_biz89") })
+	casWrite89 := func(token int64) int64 {
+		t.Helper()
+		res, err := db.ExecContext(ctx,
+			`UPDATE agentkit_fence_biz89 SET generation = $1, payload = 'written' WHERE id = 1 AND generation <= $2`,
+			token, token)
+		if err != nil {
+			t.Fatalf("CAS 写: %v", err)
+		}
+		n, _ := res.RowsAffected()
+		return n
+	}
+
+	// 任期 1：hA token=1，业务行推到 1
+	ok, gen1, err := s.TryAcquireWithToken(ctx, "fk89", "hA", time.Millisecond)
+	if err != nil || !ok || gen1 != 1 {
+		t.Fatalf("任期1: ok=%v gen=%d err=%v", ok, gen1, err)
+	}
+	// 业务行以持有者当前 token 为起点（与 TestIntegrationFencingTokenMonotonic 同款播种）
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO agentkit_fence_biz89 (id, generation) VALUES (1, $1)
+		 ON CONFLICT (id) DO UPDATE SET generation = $1, payload = ''`, gen1); err != nil {
+		t.Fatalf("播种业务行: %v", err)
+	}
+	if n := casWrite89(gen1); n != 1 {
+		t.Fatalf("任期1 写应成功，实得 %d 行", n)
+	}
+
+	// hB 过期易主 → token=2（修复前该步已单调）
+	time.Sleep(20 * time.Millisecond)
+	ok, gen2, err := s.TryAcquireWithToken(ctx, "fk89", "hB", time.Hour)
+	if err != nil || !ok {
+		t.Fatalf("任期2 夺取: ok=%v err=%v", ok, err)
+	}
+	if gen2 != 2 {
+		t.Fatalf("任期2 token = %d, want 2", gen2)
+	}
+	if n := casWrite89(gen2); n != 1 {
+		t.Fatalf("任期2 写应成功，实得 %d 行", n)
+	}
+
+	// 优雅停机让位（LeaderElector.yield 的路径）——fenced 行必须墓碑化而非删除
+	if err := s.Release(ctx, "fk89", "hB"); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	// hC 合法继任 → token 必须是 3 而不是复位成 1（#89 的核心断言）。
+	// ttl 取短：本用例末段要让任期 3 过期后再验 Cleanup 免删。
+	ok, gen3, err := s.TryAcquireWithToken(ctx, "fk89", "hC", time.Millisecond)
+	if err != nil || !ok {
+		t.Fatalf("任期3 继任: ok=%v err=%v", ok, err)
+	}
+	if gen3 != 3 {
+		t.Fatalf("任期3 token = %d, want 3——Release 删行会把 token 复位，旧主反而成最高有效 token（#89）", gen3)
+	}
+	if n := casWrite89(gen3); n != 1 {
+		t.Fatalf("任期3 首写应成功（新主不被自己拒），实得 %d 行", n)
+	}
+	// stale 旧主（hA，token=1）此刻写必须被库层拒绝
+	if n := casWrite89(gen1); n != 0 {
+		t.Fatalf("stale token %d 写得进去（%d 行）——fencing 方向性反转（#89）", gen1, n)
+	}
+
+	// Cleanup 免删 fenced 行：让任期 3 的租约过期再清——fenced 行必须在
+	time.Sleep(20 * time.Millisecond)
+	n, err := s.Cleanup(ctx)
+	if err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("Cleanup 不得删除 fenced 行（实得 %d 行）——删掉后新 token 从 1 起步（#89）", n)
+	}
+	// 过期 fenced 行照常可夺（独占性不受「不清理」影响），token 继续单调
+	ok, gen4, err := s.TryAcquireWithToken(ctx, "fk89", "hD", time.Hour)
+	if err != nil || !ok {
+		t.Fatalf("过期 fenced 行应可夺取: ok=%v err=%v", ok, err)
+	}
+	if gen4 != 4 {
+		t.Fatalf("任期4 token = %d, want 4", gen4)
+	}
+}
+
+// TestIntegrationElectorTakeoverBumpsGeneration elector 路径（TryAcquire——
+// LeaderElector.tick 唯一使用的路径）易主必须推高 generation（queue#90）：
+//
+// 修复前的确定性故障：hA token=1 写业务行 → 1，租约过期；副本 B 的
+// LeaderElector（LeaseStore 路径）夺走租约，generation 仍=1——hA 的在飞
+// fenced 写 1<=1 照写成功（恰发生在 fencing 存在的全部理由那一刻）；随后 hB
+// 用 TryAcquireWithToken 拿到的 token 与旧主完全相同，库层无从区分新旧主。
+func TestIntegrationElectorTakeoverBumpsGeneration(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	db := s.db
+
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS agentkit_fence_biz90 (
+		id BIGINT PRIMARY KEY, generation BIGINT NOT NULL, payload TEXT NOT NULL DEFAULT '')`); err != nil {
+		t.Fatalf("建业务表: %v", err)
+	}
+	t.Cleanup(func() { _, _ = db.Exec("DROP TABLE IF EXISTS agentkit_fence_biz90") })
+	casWrite90 := func(token int64) int64 {
+		t.Helper()
+		res, err := db.ExecContext(ctx,
+			`UPDATE agentkit_fence_biz90 SET generation = $1, payload = 'written' WHERE id = 1 AND generation <= $2`,
+			token, token)
+		if err != nil {
+			t.Fatalf("CAS 写: %v", err)
+		}
+		n, _ := res.RowsAffected()
+		return n
+	}
+
+	// hA：token 路径获取（关键写）→ token=1，业务行推到 1
+	ok, gen1, err := s.TryAcquireWithToken(ctx, "fk90", "hA", time.Millisecond)
+	if err != nil || !ok || gen1 != 1 {
+		t.Fatalf("前置: ok=%v gen=%d err=%v", ok, gen1, err)
+	}
+	// 业务行以持有者当前 token 为起点（同款播种）
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO agentkit_fence_biz90 (id, generation) VALUES (1, $1)
+		 ON CONFLICT (id) DO UPDATE SET generation = $1, payload = ''`, gen1); err != nil {
+		t.Fatalf("播种业务行: %v", err)
+	}
+	if n := casWrite90(gen1); n != 1 {
+		t.Fatalf("hA 首写应成功，实得 %d 行", n)
+	}
+
+	// 租约过期；副本 B 的 LeaderElector 走 **TryAcquire**（非 token 路径）夺约
+	time.Sleep(20 * time.Millisecond)
+	if ok, err := s.TryAcquire(ctx, "fk90", "hB", time.Hour); err != nil || !ok {
+		t.Fatalf("elector 路径夺取: ok=%v err=%v", ok, err)
+	}
+
+	// hB 关键写取 token：同 holder 续约保持 elector 易主时推高的值——
+	// 必须是 2 而不是 1（与旧主同 token = 库层无从区分新旧主、原子拒绝
+	// 无从发生）。这是 #90 的核心断言：elector 易主没推高 generation 的话
+	// 这里拿到的 token 与旧主完全相同。
+	ok, gen2, err := s.TryAcquireWithToken(ctx, "fk90", "hB", time.Hour)
+	if err != nil || !ok {
+		t.Fatalf("hB 取 token: ok=%v err=%v", ok, err)
+	}
+	if gen2 != 2 {
+		t.Fatalf("hB token = %d, want 2——与旧主同 token 则原子拒绝无从发生（#90）", gen2)
+	}
+
+	// 新主接管后先写一次（包文档成对纪律：关闭「接管后首写之前」的 `<=`
+	// 交叠窗口——那一段是 CAS 判据的文档化代价，不是本 issue 的缺陷面）。
+	if n := casWrite90(gen2); n != 1 {
+		t.Fatalf("hB 用 token %d 应写得进去，实得 %d 行", gen2, n)
+	}
+	// 业务行已被推到 2：hA 的在飞 stale 写（token=1）从此恒被库层拒绝。
+	if n := casWrite90(gen1); n != 0 {
+		t.Fatalf("stale token %d 仍写得进去（%d 行）——elector 路径易主没推高 generation（#90）", gen1, n)
+	}
+}
