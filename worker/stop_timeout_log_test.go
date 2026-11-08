@@ -196,9 +196,6 @@ func (q *slowHeartbeatQueue) ResetRunningToPending(context.Context, time.Duratio
 // 两处的失效形态逐字相同——Stop 返回、打 Info「stopped」、goroutine 还在跑。
 func TestStopWarnsWhenHeartbeatRoundStuck(t *testing.T) {
 	withShortHardExit(t)
-	old := heartbeatInterval
-	heartbeatInterval = 10 * time.Millisecond
-	t.Cleanup(func() { heartbeatInterval = old })
 
 	q := &slowHeartbeatQueue{entered: make(chan struct{}), release: make(chan struct{})}
 	t.Cleanup(func() { close(q.release) }) // 放开心跳轮次，不留 goroutine
@@ -209,6 +206,8 @@ func TestStopWarnsWhenHeartbeatRoundStuck(t *testing.T) {
 		Log:   logx.NewSlogLogger("test", logx.WithHandler(h)),
 		N:     1,
 		Run:   func(context.Context, string) error { return nil },
+		// 心跳周期压到毫秒级（Pool 字段可配，queue#88）——否则首个 tick 要等 15s。
+		HeartbeatInterval: 10 * time.Millisecond,
 	}
 	p.Start(context.Background())
 

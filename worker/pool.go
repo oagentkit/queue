@@ -17,18 +17,17 @@ import (
 	"github.com/oekit/logx"
 )
 
-// 默认参数。
+// 默认参数。比值纪律：HeartbeatInterval 必须 ≪ StaleRunningAfter（量化建议
+// ≥5×，见 TaskQueue doc 的时序约束段）——90s / 15s = 6×；此前 20s 的缺省是
+// 4.5×，低于文档自己的建议值（oagentkit/queue#88）。心跳周期是每 worker 每
+// 周期一次的 DB 写，15s 的增量成本可忽略；StaleRunningAfter 保持 90s（argus
+// 在役值，失联复位延迟不变）。
 const (
-	HeartbeatInterval = 20 * time.Second
+	HeartbeatInterval = 15 * time.Second
 	StaleRunningAfter = 90 * time.Second
 	// queueCallTimeout 单次守护队列调用限时（心跳续期/过期复位共用）。
 	queueCallTimeout = 5 * time.Second
 )
-
-// heartbeatInterval 心跳周期（缺省等于导出的 HeartbeatInterval）。用 var 的
-// 唯一理由同 hardExitTimeout：用例要把 20s 压到毫秒级，才能让心跳轮次在
-// Stop 时真的「在飞」——否则那条兜底 Warn 永远验不到。
-var heartbeatInterval = HeartbeatInterval
 
 // hardExitTimeout 停机第二段/心跳等待的兜底：超过即认定对方不理会 ctx，
 // 打 Warn 留痕后继续收尾（不能因为一个卡死的 goroutine 让 Stop 永不返回）。
@@ -39,19 +38,24 @@ var hardExitTimeout = 10 * time.Second
 
 // TaskQueue 任务队列存储接口（调用方实现，如 GORM/MySQL/Redis）。
 //
-// # 时序约束（宿主自实现者的正确性红线，oagentkit/queue#25）
+// # 时序约束（宿主自实现者的正确性红线，oagentkit/queue#25；可配字段
+// oagentkit/queue#88）
 //
 // TouchRunningHeartbeats 与 ResetRunningToPending 由 Pool 两个独立 goroutine
-// 分别调用（周期由宿主经 Pool 字段配置），两者的组合约束没有兜底——配错
-// 不报错，只以「同一任务双跑」的形式爆出来：
+// 分别调用，周期经 Pool.HeartbeatInterval 与 Pool.StaleAfter 配置（0 = 缺省
+// 15s / 90s；Start 对「HeartbeatInterval >= StaleAfter」构造期 panic）。组合
+// 约束没有运行期兜底——装配期把两个值配对，否则失效只以「同一任务双跑」的
+// 形式爆出来：
 //
-//   - 心跳周期 T_heartbeat 必须 ≪ staleAfter（ResetRunningToPending 的失联
-//     阈值）：**量化建议 ≥5×**（argus 在役配比 stale_after=90s / 心跳 10s）。
-//     反例：心跳 60s、staleAfter 90s——一次 GC 停顿或网络抖动错过一个心跳
-//     周期，running 任务即被误判失联重置 → 另一副本接手 → 双跑；
-//   - ResetRunningToPending 的 staleAfter 必须 > 单任务的正常执行时长上限：
-//     任务执行超过 staleAfter 且心跳同步失败时，重置会在任务仍在跑时发生
-//     （心跳在跑 = 存活信号，实现方不得只在任务结束时写）；
+//   - 心跳周期（Pool.HeartbeatInterval）必须 ≪ 失联阈值（Pool.StaleAfter）：
+//     **量化建议 ≥5×**（argus 在役配比 stale_after=90s / 心跳 10s；本包缺省
+//     90s / 15s = 6×）。反例：心跳 60s、staleAfter 90s——一次 GC 停顿或网络
+//     抖动错过一个心跳周期，running 任务即被误判失联重置 → 另一副本接手 →
+//     双跑；
+//   - Pool.StaleAfter 必须 > 单任务的正常执行时长上限：任务执行超过
+//     staleAfter 且心跳同步失败时，重置会在任务仍在跑时发生（长 LLM 调用、
+//     大批量导出、跨网段部署的宿主必须调大它；心跳在跑 = 存活信号，实现方
+//     不得只在任务结束时写）；
 //   - 优雅停机（Pool.Stop 的 grace 排水）窗口内**心跳继续续期**：Pool 用
 //     独立于 loopCtx 的 hbCtx 驱动心跳 goroutine（排水中任务仍活着，不该
 //     被他副本判失联接管——自实现的排水逻辑要保住同一承诺）；
@@ -143,6 +147,19 @@ type Pool struct {
 	// Queue 是调用方实现（GORM 等），与 runTask/claim 的 panic 隔离同一不变量：
 	// 外部代码异常不得让 worker 永久僵死——超时按 claim 失败退避重试。
 	ClaimTimeout time.Duration
+	// HeartbeatInterval 心跳周期（0 = 15s 缺省，即 HeartbeatInterval）。
+	// 必须 ≪ StaleAfter（量化建议 ≥5×）：一次 GC 停顿/网络抖动错过一个心跳
+	// 周期，running 任务就会被误判失联重置 → 另一副本接手 → 同一任务双跑。
+	// Start 对「HeartbeatInterval >= StaleAfter」构造期 panic（与
+	// NewLeaderElector 对 interval >= ttl 的处理同一道纪律，oagentkit/queue#88）。
+	// Start 之后不得再改（并发读写无保护，同 Queue/Run/N）。
+	HeartbeatInterval time.Duration
+	// StaleAfter 失联判定阈值（0 = 90s 缺省，即 StaleRunningAfter）。必须 >
+	// 单任务的正常执行时长上限——任务执行超过 staleAfter 且心跳同步失败时，
+	// 重置会在任务仍在跑时发生（长 LLM 调用、大批量导出、跨网段部署的宿主
+	// 必须调大它；此前写死 90s 不可配，宿主只能 fork，queue#88）。
+	// Start 之后不得再改。
+	StaleAfter time.Duration
 
 	inflightMu sync.Mutex          // 保护 inflight
 	inflight   map[string]struct{} // 本进程正在执行的任务（心跳续期集，见 ScopedHeartbeater）
@@ -192,6 +209,23 @@ func (p *Pool) Start(ctx context.Context) {
 	if p.N <= 0 {
 		p.N = 1
 	}
+	// 心跳参数归一（0 = 缺省）+ 比值闸门（oagentkit/queue#88）：心跳周期不短于
+	// 失联阈值时，运行中的任务在两次心跳之间就会被判失联复位——另一副本接手
+	// 即双跑，且全程零报错。与 NewLeaderElector 对 interval >= ttl 的处理同一道
+	// 构造期纪律（窗口出现在换主/复位那一刻，事后无法区分「正常复位」与「误判」）。
+	// 在置 started 之后、拉起 goroutine 之前拦截：panic 后 Pool 未启动，修好
+	// 字段还能再次 Start。
+	hbInterval := p.HeartbeatInterval
+	if hbInterval <= 0 {
+		hbInterval = HeartbeatInterval
+	}
+	staleAfter := p.StaleAfter
+	if staleAfter <= 0 {
+		staleAfter = StaleRunningAfter
+	}
+	if hbInterval >= staleAfter {
+		panic(fmt.Sprintf("worker: Pool HeartbeatInterval 必须小于 StaleAfter（HeartbeatInterval=%v StaleAfter=%v）——心跳周期不短于失联阈值时，运行中的任务会在两次心跳之间被误判失联复位，另一副本接手即双跑（oagentkit/queue#88）", hbInterval, staleAfter))
+	}
 	p.loopCtx, p.cancelLoop = context.WithCancel(ctx)
 	p.runCtx, p.cancelRun = context.WithCancel(ctx)
 	p.hbCtx, p.cancelHB = context.WithCancel(ctx)
@@ -222,8 +256,8 @@ func (p *Pool) Start(ctx context.Context) {
 	// 心跳独立等待：Stop 在任务排空后才停心跳（在途任务的心跳不能先死），
 	// 故不与 worker 同 wg——done 关闭不依赖心跳退出
 	hbLoop := loop.Run(p.hbCtx, loop.Config{
-		Interval:   heartbeatInterval,
-		FirstDelay: heartbeatInterval,
+		Interval:   hbInterval,
+		FirstDelay: hbInterval,
 		Name:       "agentkit.worker.heartbeat",
 	}, func(ctx context.Context) {
 		// 两个调用各自限时，互不挤占；并行跑——原先串行时 resetStale 慢
@@ -304,17 +338,23 @@ func (p *Pool) runTracked(runCtx context.Context, id int, taskID string) {
 }
 
 // resetStale ResetRunningToPending（panic 隔离 + 限时，骨架见 guardedCall）。
+// 阈值取 Pool.StaleAfter（0 = StaleRunningAfter 缺省，oagentkit/queue#88）——
+// 与心跳周期的比值约束见 Start 的构造期闸门与 TaskQueue doc。
 func (p *Pool) resetStale() {
+	staleAfter := p.StaleAfter
+	if staleAfter <= 0 {
+		staleAfter = StaleRunningAfter
+	}
 	var n int64
 	_ = p.guardedCall("agentkit.worker.stale_reset_panic", "agentkit.worker.stale_reset_failed",
 		func(ctx context.Context) error {
 			var err error
-			n, err = p.Queue.ResetRunningToPending(ctx, StaleRunningAfter)
+			n, err = p.Queue.ResetRunningToPending(ctx, staleAfter)
 			return err
 		})
 	if n > 0 {
 		p.logger().Warn("agentkit.worker.stale_running_reset", "count", n,
-			"stale_after", StaleRunningAfter.String())
+			"stale_after", staleAfter.String())
 	}
 }
 
