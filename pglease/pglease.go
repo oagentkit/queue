@@ -28,6 +28,25 @@
 // 且永不回退）。所以「旧 token 仍然可用」这件事在数据库层是不可能的——
 // 这正是它比「动作前再查一次 holder 是不是我」更强的地方：后者的判据
 // （holder 名）会被同名副本复用，token 不会。
+//
+// # token 单调性与行生命周期（queue#89/#90）
+//
+// 单调性判据是「业务行长期存高水位」，所以 token 必须**跨租约行生命周期**
+// 存续——行一旦被删，新行从 1 起步，旧 token 反而成为最高有效 token，
+// fencing 的方向性整个反转（拒绝新主、放行旧主）。为此：
+//
+//   - 走过 token 路径（TryAcquireWithToken）的行打 `fenced` 标记；
+//   - Release 对 fenced 行**置墓碑**（holder 清空、expires_at 置过去，
+//     generation 保留）而不是删行——让位语义（下一刻即可被夺）不变，
+//     token 单调性不破；
+//   - Cleanup 只清**非 fenced** 的过期行——fenced 行的 generation 是
+//     业务行的 CAS 依据，行在 token 在。fenced 行（每把 fencing 键一行）
+//     因此不过期自清，这是换取单调性的显式代价。
+//
+// 两条获取路径的「易主才 +1」CASE 同款（queue#90）：LeaderElector 走的
+// TryAcquire 同样在易主时推高 generation——否则「选举用 elector + 关键写
+// 取 token」的文档化组合里，elector 夺走租约的那一刻旧主的在飞写照写不误，
+// fencing 恰好在它存在的全部理由（易主）那一刻失效。
 package pglease
 
 import (
@@ -130,6 +149,13 @@ func (s *PGLeaseStore) WithTable(name string) *PGLeaseStore {
 // expires_at 用 DB 时钟（now() + make_interval）而非应用时钟——写入与过期判定
 // 必须同钟：多实例应用时钟漂移会等量放大/缩短租约实际时长，削弱「失联后
 // ≤ttl 换主」的承诺（v0.10.29 审计修复）。
+//
+// ⚠️ 易主时 generation **+1**（queue#90）：本路径是 LeaderElector.tick 的
+// 唯一获取路径，而 fencing 的判据是业务行长期存高水位——elector 夺走租约
+// 的那一刻若不推高 generation，「选举用 elector + 关键写取 token」的文档化
+// 组合里旧主的在飞写恰好照写不误（fencing 在它存在的全部理由那一刻失效）。
+// 与 token 路径同款「易主才 +1」：同一 holder 续约保持原值（它没丢过权）。
+// 顺带把首次插入的 generation 写成显式 1（此前裸走列 DEFAULT，语义相同）。
 func (s *PGLeaseStore) TryAcquire(ctx context.Context, key, holder string, ttl time.Duration) (bool, error) {
 	if err := validateIdentity(key, holder); err != nil {
 		return false, err
@@ -138,10 +164,15 @@ func (s *PGLeaseStore) TryAcquire(ctx context.Context, key, holder string, ttl t
 		return false, err
 	}
 	res, err := s.db.ExecContext(ctx, fmt.Sprintf(`
-INSERT INTO %s (key, holder, expires_at)
-VALUES ($1, $2, now() + make_interval(secs => $3))
-ON CONFLICT (key) DO UPDATE SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at
-WHERE %s.expires_at < now() OR %s.holder = EXCLUDED.holder`, s.table, s.table, s.table),
+INSERT INTO %[1]s (key, holder, expires_at, generation)
+VALUES ($1, $2, now() + make_interval(secs => $3), 1)
+ON CONFLICT (key) DO UPDATE SET
+  holder     = EXCLUDED.holder,
+  expires_at = EXCLUDED.expires_at,
+  generation = CASE WHEN %[1]s.holder = EXCLUDED.holder
+                    THEN %[1]s.generation
+                    ELSE %[1]s.generation + 1 END
+WHERE %[1]s.expires_at < now() OR %[1]s.holder = EXCLUDED.holder`, s.table),
 		key, holder, ttl.Seconds())
 	if err != nil {
 		return false, err
@@ -185,12 +216,15 @@ func (s *PGLeaseStore) TryAcquireWithToken(ctx context.Context, key, holder stri
 	// RETURNING + ON CONFLICT：命中冲突且 WHERE 不成立时**不返回行**，
 	// 于是「是否抢到」与「拿到哪个 token」是同一次原子操作的产物——
 	// 分两条语句（先判后读）会在两者之间插进另一个写者，读到的可能是别人的 token。
+	// fenced 标记（queue#89）：走过本路径的行对其后所有 Release/Cleanup
+	// 免删（Release 改墓碑、Cleanup 跳过），generation 由此跨行生命周期存续。
 	err := s.db.QueryRowContext(ctx, fmt.Sprintf(`
-INSERT INTO %[1]s (key, holder, expires_at, generation)
-VALUES ($1, $2, now() + make_interval(secs => $3), 1)
+INSERT INTO %[1]s (key, holder, expires_at, generation, fenced)
+VALUES ($1, $2, now() + make_interval(secs => $3), 1, TRUE)
 ON CONFLICT (key) DO UPDATE SET
   holder     = EXCLUDED.holder,
   expires_at = EXCLUDED.expires_at,
+  fenced     = TRUE,
   generation = CASE WHEN %[1]s.holder = EXCLUDED.holder
                     THEN %[1]s.generation
                     ELSE %[1]s.generation + 1 END
@@ -210,12 +244,27 @@ RETURNING generation`, s.table),
 // Release 仅持有者本人可释放（优雅停机让位，加速故障转移）。
 // key 或 holder 为空 → 错误：空 holder 的 DELETE 会删掉 holder=” 那把锁，
 // 而调用方给不出「本人」的证据（见 validateIdentity）。
+//
+// fenced 行（queue#89）**置墓碑**而非删行：holder 清空、expires_at 置到
+// 过去、generation 保留——下一刻即可被任何副本夺取（让位语义不变），
+// 且「清空 holder」让释放者本人随后的再获取也走易主分支 +1（权已让出，
+// 释放者的在飞动作该被作废）。直接 DELETE 的话，下一个继任者从 1 起步，
+// 而 stale 旧主手里的旧 token 反而是库里的最高有效 token——fencing 的
+// 方向性精确反转（真 PostgreSQL 16 实弹复现，queue#89）。两条分支放同一条
+// 语句的 CTE 里：同一快照内「删非 fenced / 墓碑 fenced」二选一生效，
+// 与并发的 token 获取之间没有「先读后删」的窗口。
 func (s *PGLeaseStore) Release(ctx context.Context, key, holder string) error {
 	if err := validateIdentity(key, holder); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx,
-		fmt.Sprintf(`DELETE FROM %s WHERE key = $1 AND holder = $2`, s.table), key, holder)
+	_, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+WITH del AS (
+  DELETE FROM %[1]s WHERE key = $1 AND holder = $2 AND NOT fenced RETURNING 1
+), tomb AS (
+  UPDATE %[1]s SET holder = '', expires_at = now() - make_interval(secs => 1)
+  WHERE key = $1 AND holder = $2 AND fenced RETURNING 1
+)
+SELECT (SELECT count(*) FROM del) + (SELECT count(*) FROM tomb)`, s.table), key, holder)
 	return err
 }
 
@@ -236,9 +285,15 @@ func (s *PGLeaseStore) Release(ctx context.Context, key, holder string) error {
 // 与 TryAcquire 的「顺带清理同 key 过期行」不同：那条路径只能清到本次竞争的
 // 那一个 key，高 churn 下绝大多数 key 再也不会有第二次竞争，过期行永远等不到
 // 它的「顺带」——全局扫描是这类表唯一能收敛的形态。
+//
+// ⚠️ fenced 行（queue#89）**不清理**：它们的 generation 是业务行 CAS 的
+// 高水位，行在 token 在——删掉后新行从 1 起步，stale 旧 token 反而成为
+// 最高有效 token（方向性反转）。过期 fenced 行本就可被任何副本夺取
+// （expires_at < now() 的夺约判据不受影响），清不清不影响独占性；
+// 代价是每把 fencing 键一行常驻，换取 token 单调性。
 func (s *PGLeaseStore) Cleanup(ctx context.Context) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
-		fmt.Sprintf(`DELETE FROM %s WHERE expires_at < now()`, s.table))
+		fmt.Sprintf(`DELETE FROM %s WHERE expires_at < now() AND NOT fenced`, s.table))
 	if err != nil {
 		return 0, err
 	}
@@ -259,17 +314,27 @@ func (s *PGLeaseStore) Cleanup(ctx context.Context) (int64, error) {
 // 故补列单独走 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`（PG 幂等，
 // 可反复跑）。`NOT NULL DEFAULT 1` 让存量行直接可读：它们是 fencing 之前
 // 的行，首次易主时自然涨到 2。
+//
+// fenced 列（queue#89）同款幂等补列：标记「走过 token 路径」的行，
+// Release/Cleanup 对其免删（墓碑/跳过），generation 由此跨行生命周期存续。
+// 存量行缺省 false：只走过 elector 路径的行保持可删可清（queue#33 的
+// 收敛语义不变），首次 TryAcquireWithToken 时打标。
 func (s *PGLeaseStore) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
   key        VARCHAR(64) PRIMARY KEY,
   holder     VARCHAR(128) NOT NULL,
   expires_at TIMESTAMPTZ  NOT NULL,
-  generation BIGINT       NOT NULL DEFAULT 1
+  generation BIGINT       NOT NULL DEFAULT 1,
+  fenced     BOOLEAN      NOT NULL DEFAULT FALSE
 )`, s.table)); err != nil {
 		return err
 	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		`ALTER TABLE %s ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 1`, s.table)); err != nil {
+		return err
+	}
 	_, err := s.db.ExecContext(ctx, fmt.Sprintf(
-		`ALTER TABLE %s ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 1`, s.table))
+		`ALTER TABLE %s ADD COLUMN IF NOT EXISTS fenced BOOLEAN NOT NULL DEFAULT FALSE`, s.table))
 	return err
 }
