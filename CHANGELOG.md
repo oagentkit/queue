@@ -2,6 +2,52 @@
 
 > 本文件由 `matrix-tools/scripts/gen_changelogs.py` 从 git 历史生成，按 tag 切段、取每段内的 conventional commit 渲染。
 
+## [v0.11.1] — 2026-11-10
+
+### 修复(worker,sqlqueue)：选主重启状态机 / Pool panic 可恢复 / claim attempts 真实落库（#96 #97 #98）
+
+fix(sqlqueue): ClaimNextPendingDetailed 返回真实落库 attempts，修复与并发复位的偏低报竞态（#98）
+旧实现返回「候选 SELECT 快照 +1」，隐含断言「SELECT 与守卫 UPDATE 之间
+pending 行的 attempts 不变，能改它的只有会令本调用守卫失败的 claim 类
+UPDATE」——该断言不成立：ResetRunningToPending 也做 attempts+1 且把
+running 行改回 pending，并发的「他副本 claim → 失联复位」复合序列落进
+SELECT→UPDATE 窗口时，本调用的守卫 UPDATE 仍然命中（行又变回 pending），
+返回值却比库内实际值少 2。attempts 是宿主毒任务闸门的输入
+（worker.DetailedClaimer），系统性偏低报 ⇒ 闸门晚触发、毒任务超额执行。
+- PG/SQLite：守卫 UPDATE 改为 UPDATE ... RETURNING attempts，自增与读取
+  同语句原子完成，返回值不再依赖任何窗口假设；
+- MySQL（无 RETURNING）：守卫 UPDATE 命中后立即重读同一行——行刚被本
+  调用置 running、heartbeat_at 写为当前时钟，复位判据在语句级粒度内不可
+  能命中、他副本 claim 守卫只认 pending，重读窗口内无写者；
+- 修正 ClaimNextPendingDetailed 文档里被证伪的窗口断言，如实描述竞态与
+  新取值方式。
+回归测试：
+- TestClaimAttemptsMatchesPersistedValueUnderResetRace 并发压测
+  （4 领取方 + 2 复位方 + 心跳回拨方，-race 下数秒）：对同一行的
+  reported attempts 序列必须严格递增——attempts 只增不减，修复后返回值
+  取自守卫 UPDATE 自身天然成立；缺陷下 SELECT 快照可早于上次 claim 的
+  写入，序列持平/倒退（修复前实测 683 次非严格递增）。任何一次违规都是
+  「返回值 ≠ 落库值」的实锤，正向观测（返回后的合法并发写）不作数。
+- TestClaimAttemptsSequentialExactness 顺序对照：claim/复位交错下返回值
+  逐次等于库内值（1/3/5/7，计数口径不变）。
+Closes oagentkit/queue#98
+
+- 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.31.1
+
+| 依赖 | 现地板 | 抬到 |
+|---|---|---|
+| `github.com/oekit/concurrency` | `v0.31.0` | `v0.31.1` |
+| `github.com/oekit/logx` | `v0.8.12` | `v0.9.0` |
+## 为什么
+矩阵的**发版时刻地板时效**门禁（`verify_tag_floor --ref HEAD`）要求：各仓 HEAD
+（= 下次发版会发出去的内容）的依赖地板，相对那一刻的依赖最新版本，不能已落后。
+oekit 基座与矩阵模块都在高频发版 ⇒ 地板是**跑步机**，落后一格就会判红。
+## 兼容性实测
+本工具在提交前跑完 `go build` / `go vet` / `go test -race -count=1 ./...`（全绿才提交）
+与 `go mod tidy -diff`（无漂移）⇒ 改动**只影响依赖版本**，零行为差异。
+只改 `go.mod` / `go.sum` ⇒ 不需要 CHANGELOG 条目（版本段由下次发版的 `prewrite` 生成）。
+
+
 ## [v0.11.0] — 2026-11-09
 
 ### 修复(pglease)：fencing token 跨行生命周期存续（fenced 行墓碑/免删）+ elector 路径易主推高 generation（#89 #90）
