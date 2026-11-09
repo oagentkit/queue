@@ -2,11 +2,116 @@
 
 > 本文件由 `matrix-tools/scripts/gen_changelogs.py` 从 git 历史生成，按 tag 切段、取每段内的 conventional commit 渲染。
 
+## [v0.11.0] — 2026-11-09
+
+### 修复(pglease)：fencing token 跨行生命周期存续（fenced 行墓碑/免删）+ elector 路径易主推高 generation（#89 #90）
+
+- cca020f
+
+### 修复：queue 第三轮 issue 清零（#83 #84 #85 #86 #87 #88）
+
+* fix(sqllease): 长度护栏与过期租约清理移植到三方言实现（#83 #84）
+- #83：MaxKeyLen/MaxHolderLen 常量与 Migrate 的 VARCHAR 同源派生，
+  validateIdentity 补 rune 口径长度校验（TryAcquire/Release 共用），
+  ErrKeyTooLong/ErrHolderTooLong 哨兵——pglease#34 的三方言移植；
+- #84：新增 Cleanup（DB 时钟判据、RowsAffected 透传），方言时钟判据
+  以 ExpiredPredicate() 公共出口单源派生（TryAcquire/Cleanup/定向清理
+  同钟）；worker 增 LeaseCleaner 可选接口（类型断言探测，不改
+  LeaseStore），sqllease/pglease 两参考实现编译期钉住；
+- 测试：recording stub driver 三方言矩阵（哨兵+driver 零调用+边界放行
+  +rune 口径；DELETE 形态+严格小于+无占位符+行数透传）。
+* fix(sqlqueue): 构造期拦超长 runnerID、Enqueue 哨兵拦超长 taskID（#85）
+New 此前只拦空 runnerID（#69/#43），长度不设防：Migrate 声明
+task_id VARCHAR(64)/runner_id VARCHAR(128)，超长值原样交 driver——
+PG/MySQL strict 报 driver 通用错误（runnerID 那条报错点在首次 claim
+的后台循环），MySQL 非 strict 静默截断（任务塌行/副本互认身份），
+SQLite 原样放行。
+- New 补长度 panic（与空身份同一道构造期闸门，rune 口径）；
+- Enqueue 触库前返回哨兵 ErrTaskIDTooLong；
+- MaxTaskIDLen/MaxRunnerIDLen 常量派生 Migrate 的 VARCHAR（护栏与
+  DDL 同源，改一处忘另一处即复现本缺陷）；
+- 测试：recording stub driver 三方言矩阵（panic/哨兵 + driver 零调用
+  + 边界放行 + 64 汉字放行 + 真 SQLite 边界对照）。
+* fix(sqlqueue): WithMaxAttempts 语义修正为真实执行次数（#86）
+claim 与失联复位各消耗一次计数、终态判定只看复位旧值（attempts ≥ n），
+实际执行次数是 floor(n/2)+1——WithMaxAttempts(3) 只执行 2 次，API 名字
+承诺的「尝试次数」与行为对不上；且副本抖动（失联复位）会把健康任务
+提前判进死信。
+- 终态判据折算成执行次数：复位时点已执行 k 次 ⟺ attempts=2k-1
+  （claim+reset 各 +1 的既有计数口径不变），判 attempts ≥ 2n-1 ⟺
+  已执行 ≥ n 次；阈值在 Go 侧算出，不在 SQL 里做除法（MySQL 的 /
+  是小数除法，三方言不等价）；
+- attempts 表内计数口径不变（queue#70 契约与既有用例不破坏），
+  dead_letter 行定格 2n；缺省（n=0）不封顶路径 SQL 逐字不变
+  （兼容性红线）；
+- 测试：表驱动 n=1..5 断言实际执行次数 1,2,3,4,5 且终态/attempts 定格；
+  副本抖动用例（n-1 轮不触顶、恰第 n 轮进终态）；既有 #70 毒任务
+  用例按新语义更新轮次。
+* fix(sqlqueue): MySQL 索引判存补 table_schema=DATABASE() 限定（#87）
+information_schema.statistics 是跨库视图，原判存只绑 table_name +
+index_name——同一实例上任意 schema 有同名表 + 同名索引（索引名由表名
+派生，dev/prod 并存、mysqldump 复制库、多租户每租户一 schema 都命中）
+即误判「已存在」并跳过，本 schema 的索引永不创建且零报错；任务表是
+高频读写面，症状表现为吞吐下降与 DB CPU 上涨，排查方向被引向
+「任务太多」。
+- 判存补 table_schema = DATABASE()（取值绑定不在语句内调用，避开
+  个别代理/中间件对 DATABASE() 的支持差异）；
+- 索引名改为直接计算，删除从自己刚拼的 ALTER 语句反解的 indexName
+  （脆弱且无必要）；
+- 测试：stub driver 断言判存语句含 table_schema/DATABASE() 与绑定
+  参数面；成对对照（判存命中不发 ALTER / 未命中发两条）；真 SQLite
+  重复 Migrate 幂等。
+* feat(worker): Pool 补 HeartbeatInterval/StaleAfter 字段与构造期比值闸门（#88）
+TaskQueue doc 宣称「周期由宿主经 Pool 字段配置」，但 Pool 没有那两个字段
+——心跳周期是包内未导出 var（进程全局、无锁可变、两个 Pool 无法各配一份），
+staleAfter 是 const 直接传下去；文档自定的两条红线宿主都遵守不了，失效
+静默（配不上不报错，只在心跳轮次错过时以「同一任务双跑」爆出来）。
+- Pool 新增 HeartbeatInterval / StaleAfter 字段（0 = 15s/90s 缺省，与
+  ClaimTimeout 同一「0 = 缺省」形态），resetStale 归一后传值；
+- Start 构造期闸门：HeartbeatInterval >= StaleAfter 直接 panic（与
+  NewLeaderElector 对 interval >= ttl 同一道纪律）；置 started 之前拦截，
+  修好字段还能再次 Start；
+- 缺省比值对齐文档：HeartbeatInterval 20s → 15s（90s/15s = 6× ≥ 文档
+  建议的 ≥5×；StaleRunningAfter 保持 90s 不动，argus 在役失联复位延迟
+  不变）；
+- 收掉进程全局可变的 heartbeatInterval 包级 var（测试改走字段）；
+- 测试：配置值逐字透传到 ResetRunningToPending（不是 90s）、心跳周期
+  字段驱动循环、缺省必须仍是 90s、成对对照（hb*5 ≤ stale 放行 / 缺省
+  放行 / 四种越界 panic）、缺省比值 ≥5× 的守门测试。
+
+- 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.31.0
+
+| 依赖 | 现地板 | 抬到 |
+|---|---|---|
+| `github.com/oekit/concurrency` | `v0.30.1` | `v0.31.0` |
+## 为什么
+矩阵的**发版时刻地板时效**门禁（`verify_tag_floor --ref HEAD`）要求：各仓 HEAD
+（= 下次发版会发出去的内容）的依赖地板，相对那一刻的依赖最新版本，不能已落后。
+oekit 基座与矩阵模块都在高频发版 ⇒ 地板是**跑步机**，落后一格就会判红。
+## 兼容性实测
+本工具在提交前跑完 `go build` / `go vet` / `go test -race -count=1 ./...`（全绿才提交）
+与 `go mod tidy -diff`（无漂移）⇒ 改动**只影响依赖版本**，零行为差异。
+只改 `go.mod` / `go.sum` ⇒ 不需要 CHANGELOG 条目（版本段由下次发版的 `prewrite` 生成）。
+
+- 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.30.1
+
+| 依赖 | 现地板 | 抬到 |
+|---|---|---|
+| `github.com/oekit/concurrency` | `v0.29.0` | `v0.30.1` |
+| `github.com/oekit/logx` | `v0.8.11` | `v0.8.12` |
+## 为什么
+矩阵的**发版时刻地板时效**门禁（`verify_tag_floor --ref HEAD`）要求：各仓 HEAD
+（= 下次发版会发出去的内容）的依赖地板，相对那一刻的依赖最新版本，不能已落后。
+oekit 基座与矩阵模块都在高频发版 ⇒ 地板是**跑步机**，落后一格就会判红。
+## 兼容性实测
+本工具在提交前跑完 `go build` / `go vet` / `go test -race -count=1 ./...`（全绿才提交）
+与 `go mod tidy -diff`（无漂移）⇒ 改动**只影响依赖版本**，零行为差异。
+只改 `go.mod` / `go.sum` ⇒ 不需要 CHANGELOG 条目（版本段由下次发版的 `prewrite` 生成）。
+
+
 ## [v0.10.4] — 2026-11-08
 
-### 依赖地板：oekit 基座追平——pkg v0.38.0 / logx v0.8.11 / concurrency v0.29.0
-
-oekit BOM v0.2.11 兼容地板门禁（oekit#163）对齐轮；无代码变更。
+- 与 v0.10.3 相比无代码差异（版本号/打包变更）
 
 ## [v0.10.3] — 2026-11-08
 
