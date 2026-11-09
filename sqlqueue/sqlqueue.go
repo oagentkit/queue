@@ -190,44 +190,91 @@ func (s *Store) ClaimNextPending(ctx context.Context) (string, bool, error) {
 // ClaimNextPendingDetailed 是 ClaimNextPending 的加强版：额外返回领取时点的
 // attempts 计数（worker.DetailedClaimer 实现，oagentkit/queue#70）。
 //
-// attempts 是**含本次领取**的值（候选行快照 +1，守卫 UPDATE 的自增即本调用的
-// 写入）：首次领取 = 1，失联复位一轮后重领 = 3（claim+reset+claim）。宿主据此
-// 可在消费侧实现自己的毒任务闸门（例如 attempts > N 时改走本地死信处理），
-// 无需直查内部表。ok=false 时 attempts 无意义（恒 0）。
+// attempts 是**含本次领取**的值：首次领取 = 1，失联复位一轮后重领 = 3
+// （claim+reset+claim）。宿主据此可在消费侧实现自己的毒任务闸门（例如
+// attempts > N 时改走本地死信处理），无需直查内部表。ok=false 时 attempts
+// 无意义（恒 0）。
 //
-// 守卫 UPDATE 语义与 ClaimNextPending 完全一致：候选 SELECT 与守卫 UPDATE 之间
-// 不可能有并发写改动 pending 行的 attempts（能改它的只有 claim 类守卫 UPDATE，
-// 而那会让本调用的守卫失败进下一候选），故返回值即真实落库值。
+// 返回值即本次守卫 UPDATE 真实落库的 attempts（oagentkit/queue#98）：
+// PG/SQLite 用 `UPDATE ... RETURNING attempts`，自增与读取同语句原子完成；
+// MySQL 无 RETURNING，守卫 UPDATE 命中后**立即**重读同一行（行刚被本调用
+// 置为 running、heartbeat_at 写为当前时钟，复位判据 heartbeat_at <
+// now()-staleAfter 在语句级粒度内不可能命中，他副本的 claim 守卫又只认
+// pending——重读窗口内无写者，读到的就是本调用写的值）。
+//
+// 此前返回「候选 SELECT 快照 +1」，隐含断言「SELECT 与 UPDATE 之间 attempts
+// 不变」——该断言不成立：ResetRunningToPending 也做 attempts+1 且把 running
+// 行改回 pending，并发的「他副本 claim → 复位」复合序列落进 SELECT→UPDATE
+// 窗口时，本调用的守卫 UPDATE 仍然命中（行又变回 pending），返回值却比库内
+// 实际值少 2——毒任务闸门系统性偏低报、晚触发（queue#98）。
 func (s *Store) ClaimNextPendingDetailed(ctx context.Context) (string, int, bool, error) {
 	for i := 0; i < claimRetries; i++ {
 		var candidate string
-		var seen int
-		q := fmt.Sprintf(`SELECT task_id, attempts FROM %s WHERE status = '%s'
+		q := fmt.Sprintf(`SELECT task_id FROM %s WHERE status = '%s'
 ORDER BY created_at, task_id LIMIT 1`, s.table, StatusPending)
-		if err := s.db.QueryRowContext(ctx, q).Scan(&candidate, &seen); err != nil {
+		if err := s.db.QueryRowContext(ctx, q).Scan(&candidate); err != nil {
 			if err == sql.ErrNoRows {
 				return "", 0, false, nil
 			}
 			return "", 0, false, err
 		}
+		if s.dialect == MySQL {
+			id, attempts, ok, err := s.claimMySQL(ctx, candidate)
+			if err != nil {
+				return "", 0, false, err
+			}
+			if ok {
+				return id, attempts, true, nil
+			}
+			// 候选被他副本抢先 → 重试下一候选
+			continue
+		}
+		// PG / SQLite：RETURNING 把「自增」与「读取」收进同一条语句——返回值
+		// 不再依赖任何窗口假设，落库多少返回多少（oagentkit/queue#98）。
 		q = fmt.Sprintf(`UPDATE %s SET status = '%s', runner_id = %s,
 heartbeat_at = %s, attempts = attempts + 1
-WHERE task_id = %s AND status = '%s'`,
+WHERE task_id = %s AND status = '%s' RETURNING attempts`,
 			s.table, StatusRunning, s.ph(1), s.nowFn(), s.ph(2), StatusPending)
-		res, err := s.db.ExecContext(ctx, q, s.runnerID, candidate)
+		var attempts int
+		err := s.db.QueryRowContext(ctx, q, s.runnerID, candidate).Scan(&attempts)
 		if err != nil {
+			if err == sql.ErrNoRows {
+				// 候选被他副本抢先（守卫落空，无返回行）→ 重试下一候选
+				continue
+			}
 			return "", 0, false, err
 		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return "", 0, false, err
-		}
-		if n > 0 {
-			return candidate, seen + 1, true, nil
-		}
-		// 候选被他副本抢先 → 重试下一候选
+		return candidate, attempts, true, nil
 	}
 	return "", 0, false, nil
+}
+
+// claimMySQL MySQL 方言的 claim 尾段：无 RETURNING，守卫 UPDATE 命中后立即
+// 重读 attempts。重读窗口内无写者（见 ClaimNextPendingDetailed 文档），
+// 读到的即本调用落库的值。
+func (s *Store) claimMySQL(ctx context.Context, candidate string) (string, int, bool, error) {
+	q := fmt.Sprintf(`UPDATE %s SET status = '%s', runner_id = %s,
+heartbeat_at = %s, attempts = attempts + 1
+WHERE task_id = %s AND status = '%s'`,
+		s.table, StatusRunning, s.ph(1), s.nowFn(), s.ph(2), StatusPending)
+	res, err := s.db.ExecContext(ctx, q, s.runnerID, candidate)
+	if err != nil {
+		return "", 0, false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return "", 0, false, err
+	}
+	if n == 0 {
+		// 候选被他副本抢先 → 交给调用方重试下一候选
+		return "", 0, false, nil
+	}
+	q = fmt.Sprintf(`SELECT attempts FROM %s WHERE task_id = %s`, s.table, s.ph(1))
+	var attempts int
+	if err := s.db.QueryRowContext(ctx, q, candidate).Scan(&attempts); err != nil {
+		return "", 0, false, err
+	}
+	return candidate, attempts, true, nil
 }
 
 // TouchRunningHeartbeats 续期本实例 running 任务的心跳（批量单 UPDATE）。
