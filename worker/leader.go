@@ -121,14 +121,14 @@ type LeaderElector struct {
 	mu          sync.Mutex
 	leader      bool
 	everStarted bool          // Start 是否被调用过（Stop 是否该动手，queue#37）
+	running     bool          // 竞选 goroutine 在跑（生命周期状态机，queue#96）
+	stopClosed  bool          // 本生命周期是否已关闭 stop（Stop 幂等的门，替代 stopOnce——Once 无法随生命周期重置）
 	stop        chan struct{} // Stop 请求信号
 	// done 竞选定稿且回调已排空（限时）后关闭——Stop 等它，故「Stop 返回」
 	// 同时意味着「不再翻转角色」与「已入队的回调都跑过了」。
-	done      chan struct{}
-	cbCh      chan func()   // 角色翻转回调队列：竞选 goroutine 是唯一写者
-	cbDone    chan struct{} // 回调调度 goroutine 退出后关闭
-	stopOnce  sync.Once
-	startOnce sync.Once
+	done   chan struct{}
+	cbCh   chan func()   // 角色翻转回调队列：竞选 goroutine 是唯一写者
+	cbDone chan struct{} // 回调调度 goroutine 退出后关闭
 }
 
 // LeaderOption 选主器可选项。
@@ -208,54 +208,92 @@ func NewLeaderElector(store LeaseStore, key, holder string, ttl, interval time.D
 
 // Start 启动竞选循环：立即竞争一次（缩短冷启动等待），此后按 interval 续约。
 // ctx 取消或 Stop() 退出；退出前若持有租约则主动让位（计划内交接，不触发 onLost）。
-// 重复调用为 no-op（只允许一个竞选 goroutine）。
+// 竞选进行中的重复调用为 no-op（只允许一个竞选 goroutine）。
+//
+// Stop（或 ctx 取消）之后再 Start 会**重建竞选 goroutine、重新参选**
+// （oagentkit/queue#96）：启动流程曾被 startOnce 包住，Stop 消耗 Once 之后
+// 第二次 Start 的函数体一次都不执行——不拉起 goroutine、无日志无错误，选主器
+// 被静默砖化（其他副本接管租约，本实例自以为还在参选）。改为显式状态机
+// （running/stopClosed + 锁）：同一时刻至多一条生命周期，退出后 Start 开新
+// 生命周期，通道组随之重建。重复 Start（已在跑）与 Pool.start_ignored 同款
+// 口径留 Warn 观测面；重启落 Info（restarted），「已重启」与「被忽略」从此
+// 在日志里可区分。
 func (e *LeaderElector) Start(ctx context.Context) {
-	e.startOnce.Do(func() {
-		// everStarted 同步置位（在拉起 goroutine 之前）：Stop 若在 goroutine
-		// 尚未起来时读到 false 会直接返回，既不等待也不让位，租约泄漏。
-		//
-		// 置位与 Stop 的读在同一把锁内：否则存在「Stop 读到 false 当成未启动
-		// no-op，Start 紧接着照常参选」的窗口——调用方以为已停机，选主器还在跑。
-		e.mu.Lock()
-		e.everStarted = true
-		e.cbCh = make(chan func(), callbackQueue)
-		e.cbDone = make(chan struct{})
+	e.mu.Lock()
+	if e.running {
 		e.mu.Unlock()
+		// 竞选进行中的重复 Start：文档化 no-op 契约（只允许一个竞选
+		// goroutine），但不再静默——留观测面供误重启排查（与 pool.go
+		// start_ignored 同款口径，oagentkit/queue#96）。
+		e.log.Warn("agentkit.leader.start_ignored", "key", e.key, "reason", "already_running")
+		return
+	}
+	// everStarted 同步置位（在拉起 goroutine 之前）：Stop 若在 goroutine
+	// 尚未起来时读到 false 会直接返回，既不等待也不让位，租约泄漏。
+	//
+	// 置位与 Stop 的读在同一把锁内：否则存在「Stop 读到 false 当成未启动
+	// no-op，Start 紧接着照常参选」的窗口——调用方以为已停机，选主器还在跑。
+	restarted := e.everStarted
+	e.everStarted = true
+	e.running = true
+	e.stopClosed = false
+	e.stop = make(chan struct{})
+	e.done = make(chan struct{})
+	e.cbCh = make(chan func(), callbackQueue)
+	e.cbDone = make(chan struct{})
+	// 生命周期通道组以局部变量捕获：竞选 goroutine 只触碰自己这轮的通道，
+	// 与下一轮 Start 的重建互不干扰（running 清零是旧 goroutine 的最后一步，
+	// 新生命周期在它之后才可能开——见下方 defer 的次序说明）。
+	stopCh, doneCh, cbCh, cbDone := e.stop, e.done, e.cbCh, e.cbDone
+	e.mu.Unlock()
 
-		// 回调调度 goroutine：与竞选循环解耦（queue#41），范围读走完 cbCh
-		// 即退出。单个回调的 panic 在 runCallback 内收编，不打死调度器。
-		async.GoSafe(func() {
-			defer close(e.cbDone)
-			for f := range e.cbCh {
-				e.runCallback(f)
-			}
-		})
-		// GoWithContext（ekit v0.29 补齐的携带 ctx 安全 goroutine）：tick 与
-		// select 消费同一个显式传入的 ctx
-		async.GoWithContext(ctx, func(ctx context.Context) {
-			defer e.finishCampaign()
-			ticker := time.NewTicker(e.interval)
-			defer ticker.Stop()
-			if !e.tick(ctx) {
+	if restarted {
+		e.log.Info("agentkit.leader.restarted", "key", e.key, "holder", e.holder)
+	}
+
+	// 回调调度 goroutine：与竞选循环解耦（queue#41），范围读走完 cbCh
+	// 即退出。单个回调的 panic 在 runCallback 内收编，不打死调度器。
+	async.GoSafe(func() {
+		defer close(cbDone)
+		for f := range cbCh {
+			e.runCallback(f)
+		}
+	})
+	// GoWithContext（ekit v0.29 补齐的携带 ctx 安全 goroutine）：tick 与
+	// select 消费同一个显式传入的 ctx
+	async.GoWithContext(ctx, func(ctx context.Context) {
+		// defer LIFO——退出收尾次序有讲究（queue#96）：先 finishCampaign
+		// （封回调队列 → 排空 → 关 done，Stop 的等待点由此解除），**最后**
+		// 清 running。running 清零是本 goroutine 的最后一步：Start 的重启
+		// 分支只可能在它之后替换通道组，旧生命周期的 tick/yield/回调入队
+		// 因此绝不会摸到新一轮的 stop/cbCh。
+		defer func() {
+			e.mu.Lock()
+			e.running = false
+			e.mu.Unlock()
+		}()
+		defer e.finishCampaign(cbCh, cbDone, doneCh)
+		ticker := time.NewTicker(e.interval)
+		defer ticker.Stop()
+		if !e.tick(ctx) {
+			e.yield()
+			return
+		}
+		for {
+			select {
+			case <-ctx.Done():
 				e.yield()
 				return
-			}
-			for {
-				select {
-				case <-ctx.Done():
+			case <-stopCh:
+				e.yield()
+				return
+			case <-ticker.C:
+				if !e.tick(ctx) {
 					e.yield()
 					return
-				case <-e.stop:
-					e.yield()
-					return
-				case <-ticker.C:
-					if !e.tick(ctx) {
-						e.yield()
-						return
-					}
 				}
 			}
-		})
+		}
 	})
 }
 
@@ -269,9 +307,10 @@ func (e *LeaderElector) IsLeader() bool {
 // Stop 停止竞选并主动让位（幂等；优雅停机的计划内交接，不触发 onLost）。
 // 等待竞选 goroutine 退出后返回——返回后 IsLeader 必为 false 且租约已让出。
 // Start 未被调用时立即返回（无租约可让），且**不消耗停机状态**：此后 Start
-// 依然能正常参选，之后真正的 Stop 也依然有效。
+// 依然能正常参选，之后真正的 Stop 也依然有效。停机完成后再次 Start 可重启
+// 竞选（oagentkit/queue#96，状态机语义见 Start 文档）。
 //
-// 后半句是本方法唯一需要小心的地方（oagentkit/queue#37）：曾无条件
+// 「不消耗停机状态」是本方法需要小心的地方（oagentkit/queue#37）：曾无条件
 // `close(e.stop)`，于是「Start 之前误调一次 Stop」就把 startOnce 与 stop 一起
 // 烧掉——之后的 Start 其竞选 goroutine 首个 tick 即 stopping()==true 直接退出，
 // 选主器永不参选、IsLeader() 恒 false，无日志无错误。这是「误调用一次即静默
@@ -283,9 +322,17 @@ func (e *LeaderElector) Stop() {
 		e.mu.Unlock()
 		return
 	}
-	e.stopOnce.Do(func() { close(e.stop) })
+	// done 必须与 close(stop) 在同一把锁内捕获：Stop 的等待目标必须是**自己
+	// 停掉的这一轮生命周期**——否则 Stop 与 Start（重启）并发时，重启已把
+	// e.done 换成新一轮的通道，本 Stop 会挂在新轮的 done 上等一个不该由
+	// 它等的结果。
+	done := e.done
+	if !e.stopClosed {
+		close(e.stop)
+		e.stopClosed = true
+	}
 	e.mu.Unlock()
-	<-e.done
+	<-done
 }
 
 // stopping 已请求停止。
@@ -372,23 +419,25 @@ func (e *LeaderElector) yield() {
 }
 
 // finishCampaign 竞选 goroutine 的退出收尾：先封住回调队列，再等调度器排空，
-// 最后关 done。
+// 最后关 done。通道一律来自参数（本轮生命周期的局部捕获）——重启后 e.cbCh
+// 等字段已被新一轮 Start 换掉，收尾必须关自己那一轮的通道而不是字段里的
+// 新通道（oagentkit/queue#96）。
 //
 // 顺序有含义：done 是 Stop 唯一的等待点，所以它必须表示「不再翻转角色**且**
 // 已入队的回调都跑过了」——否则调用方在 Stop 之后读到的组件状态仍是「还没收到
 // onLost」的旧值，而那正是它指望 Stop 保证的事。
-func (e *LeaderElector) finishCampaign() {
+func (e *LeaderElector) finishCampaign(cbCh chan func(), cbDone, done chan struct{}) {
 	// 本 goroutine 是 cbCh 的唯一写者（setLeader 只从 tick 里调），
 	// 故此处 close 不会与入队撞上。
-	close(e.cbCh)
+	close(cbCh)
 	select {
-	case <-e.cbDone:
+	case <-cbDone:
 	case <-time.After(callbackDrainTimeout):
 		e.log.Warn("agentkit.leader.callback_drain_timeout",
 			"key", e.key, "waited", callbackDrainTimeout.String(),
 			"action", "角色翻转回调未在限期内返回，Stop 不再等它——回调 goroutine 仍在运行，其组件状态可能滞后")
 	}
-	close(e.done)
+	close(done)
 }
 
 // enqueueCallback 把角色翻转回调交给调度 goroutine（queue#41）。

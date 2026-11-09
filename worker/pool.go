@@ -189,23 +189,27 @@ func (p *Pool) logger() logx.Logger {
 }
 
 // Start 启动 N 个常驻 worker（重复调用为 no-op——字段不重置、旧 goroutine 不泄漏）。
+//
+// 比值闸门（HeartbeatInterval >= StaleAfter）panic 后 Pool 保持**未启动**：
+// 闸门在置 started 之前判定，且锁经 defer 释放（oagentkit/queue#97）——
+// 修复前手工配对的 Unlock 被 panic 跳过，互斥量永久泄漏（Start/Stop 全部
+// 卡死，优雅停机永不返回），started 又已置位（再次 Start 只会静默 no-op），
+// 注释承诺的「修好字段还能再次 Start」两条都不成立。
 func (p *Pool) Start(ctx context.Context) {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.started {
-		p.mu.Unlock()
 		// 二次 Start 静默 no-op 是文档化契约——留观测面供误重启排查
 		//（第九轮审计速赢：Stop 后 Start 同样落此分支，reason 区分形态）
 		p.logger().Warn("agentkit.worker.start_ignored", "reason", "already_started")
 		return
 	}
 	if p.stopped {
-		p.mu.Unlock()
 		// Stop 后 Start：单次生命周期契约（字段不重置、旧 goroutine 已收）——
 		// 需要重启应构造新 Pool（工厂语义，v2 若开）
 		p.logger().Warn("agentkit.worker.start_ignored", "reason", "stopped_pool_not_restartable")
 		return
 	}
-	p.started = true
 	if p.N <= 0 {
 		p.N = 1
 	}
@@ -213,8 +217,9 @@ func (p *Pool) Start(ctx context.Context) {
 	// 失联阈值时，运行中的任务在两次心跳之间就会被判失联复位——另一副本接手
 	// 即双跑，且全程零报错。与 NewLeaderElector 对 interval >= ttl 的处理同一道
 	// 构造期纪律（窗口出现在换主/复位那一刻，事后无法区分「正常复位」与「误判」）。
-	// 在置 started 之后、拉起 goroutine 之前拦截：panic 后 Pool 未启动，修好
-	// 字段还能再次 Start。
+	// 闸门在置 started **之前**判定（oagentkit/queue#97）：panic 后 Pool 未
+	// 启动，修好字段还能再次 Start——置位先于闸门时，panic 后 started=true
+	// 把重试 Start 吞成 already_started 的静默 no-op。
 	hbInterval := p.HeartbeatInterval
 	if hbInterval <= 0 {
 		hbInterval = HeartbeatInterval
@@ -226,6 +231,7 @@ func (p *Pool) Start(ctx context.Context) {
 	if hbInterval >= staleAfter {
 		panic(fmt.Sprintf("worker: Pool HeartbeatInterval 必须小于 StaleAfter（HeartbeatInterval=%v StaleAfter=%v）——心跳周期不短于失联阈值时，运行中的任务会在两次心跳之间被误判失联复位，另一副本接手即双跑（oagentkit/queue#88）", hbInterval, staleAfter))
 	}
+	p.started = true
 	p.loopCtx, p.cancelLoop = context.WithCancel(ctx)
 	p.runCtx, p.cancelRun = context.WithCancel(ctx)
 	p.hbCtx, p.cancelHB = context.WithCancel(ctx)
@@ -273,7 +279,6 @@ func (p *Pool) Start(ctx context.Context) {
 		defer close(p.hbDone)
 		hbLoop.Wait() // 停机排水：在飞轮次跑完
 	})
-	p.mu.Unlock()
 	p.logger().Info("agentkit.worker.started", "workers", p.N)
 }
 
