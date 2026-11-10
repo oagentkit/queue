@@ -126,7 +126,12 @@ type LeaderElector struct {
 	stop        chan struct{} // Stop 请求信号
 	// done 竞选定稿且回调已排空（限时）后关闭——Stop 等它，故「Stop 返回」
 	// 同时意味着「不再翻转角色」与「已入队的回调都跑过了」。
+	// done 与 quit 是两个信号（queue#103）：close(done)（finishCampaign 尾部）
+	// 先于 running 清零（defer LIFO），Stop 只等 done 会在 running 仍为 true
+	// 时返回——紧接的 Start 命中 already_running 被静默吞掉，本副本不再参选。
+	// quit 在 running 清零后的最后一步关闭，Stop 等满双信号。
 	done   chan struct{}
+	quit   chan struct{} // running 清零后的收尾信号（queue#103）
 	cbCh   chan func()   // 角色翻转回调队列：竞选 goroutine 是唯一写者
 	cbDone chan struct{} // 回调调度 goroutine 退出后关闭
 }
@@ -239,12 +244,13 @@ func (e *LeaderElector) Start(ctx context.Context) {
 	e.stopClosed = false
 	e.stop = make(chan struct{})
 	e.done = make(chan struct{})
+	e.quit = make(chan struct{})
 	e.cbCh = make(chan func(), callbackQueue)
 	e.cbDone = make(chan struct{})
 	// 生命周期通道组以局部变量捕获：竞选 goroutine 只触碰自己这轮的通道，
 	// 与下一轮 Start 的重建互不干扰（running 清零是旧 goroutine 的最后一步，
 	// 新生命周期在它之后才可能开——见下方 defer 的次序说明）。
-	stopCh, doneCh, cbCh, cbDone := e.stop, e.done, e.cbCh, e.cbDone
+	stopCh, doneCh, quitCh, cbCh, cbDone := e.stop, e.done, e.quit, e.cbCh, e.cbDone
 	e.mu.Unlock()
 
 	if restarted {
@@ -267,6 +273,10 @@ func (e *LeaderElector) Start(ctx context.Context) {
 		// 清 running。running 清零是本 goroutine 的最后一步：Start 的重启
 		// 分支只可能在它之后替换通道组，旧生命周期的 tick/yield/回调入队
 		// 因此绝不会摸到新一轮的 stop/cbCh。
+		// quit 信号（queue#103）：注册最先 → 执行最后（在 running 清零之后
+		// 关闭）——Stop 等满「done + quit」双信号才返回，不再有「close(done)
+		// 与 running 清零之间」的窗口让紧接的 Start 被静默吞掉。
+		defer close(quitCh)
 		defer func() {
 			e.mu.Lock()
 			e.running = false
@@ -326,13 +336,19 @@ func (e *LeaderElector) Stop() {
 	// 停掉的这一轮生命周期**——否则 Stop 与 Start（重启）并发时，重启已把
 	// e.done 换成新一轮的通道，本 Stop 会挂在新轮的 done 上等一个不该由
 	// 它等的结果。
-	done := e.done
+	// quit 同锁捕获（queue#103）：done 关闭（finishCampaign 尾部）早于
+	// running 清零（defer LIFO），只等 done 的 Stop 在窗口内返回后，紧接的
+	// Start 命中 already_running 被静默吞掉（本副本不再参选、租约被他副本
+	// 接管）。等满「done + quit」双信号：quit 在 running 清零后的最后一步
+	// 关闭，Stop 返回即重启安全。
+	done, quit := e.done, e.quit
 	if !e.stopClosed {
 		close(e.stop)
 		e.stopClosed = true
 	}
 	e.mu.Unlock()
 	<-done
+	<-quit
 }
 
 // stopping 已请求停止。
@@ -366,7 +382,7 @@ func (e *LeaderElector) releaseLease() {
 	ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
 	defer cancel()
 	if err := e.store.Release(ctx, e.key, e.holder); err != nil {
-		e.log.Warn("agentkit.leader.release_failed", "key", e.key, "error", err.Error())
+		e.log.Warn("agentkit.leader.release_failed", "key", e.key, logx.ErrKey, err.Error())
 	}
 }
 
@@ -393,7 +409,7 @@ func (e *LeaderElector) tick(ctx context.Context) bool {
 		}
 		// 存储抖动：保守认为失主（回调方组件按非 leader 收敛），下个周期重试
 		e.setLeader(false)
-		e.log.Warn("agentkit.leader.acquire_failed", "key", e.key, "error", err.Error())
+		e.log.Warn("agentkit.leader.acquire_failed", "key", e.key, logx.ErrKey, err.Error())
 		return true
 	}
 	if ok && e.stopping() {

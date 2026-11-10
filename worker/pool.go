@@ -395,7 +395,7 @@ func (p *Pool) guardedCall(panicLog, failLog string, fn func(ctx context.Context
 		return fmt.Errorf("worker: queue panic: %v", pe.Value)
 	}
 	if err != nil {
-		p.logger().Warn(failLog, "error", err.Error())
+		p.logger().Warn(failLog, logx.ErrKey, err.Error())
 	}
 	return err
 }
@@ -464,7 +464,7 @@ func (p *Pool) loop(loopCtx, runCtx context.Context, id int) {
 			if loopCtx.Err() != nil {
 				return
 			}
-			p.logger().Error("agentkit.worker.claim_failed", "worker", id, "error", err.Error())
+			p.logger().Error("agentkit.worker.claim_failed", "worker", id, logx.ErrKey, err.Error())
 			sleepCtx(loopCtx, time.Second)
 			continue
 		}
@@ -528,7 +528,7 @@ func (p *Pool) runTask(runCtx context.Context, id int, taskID string) {
 	if err != nil {
 		var pe *async.PanicError
 		if !errors.As(err, &pe) { // panic 已随 Handler 落 task_panic 日志
-			p.logger().Error("agentkit.worker.run_error", "worker", id, "task", taskID, "error", err.Error())
+			p.logger().Error("agentkit.worker.run_error", "worker", id, "task", taskID, logx.ErrKey, err.Error())
 		}
 	}
 }
