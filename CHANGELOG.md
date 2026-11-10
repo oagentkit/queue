@@ -2,6 +2,64 @@
 
 > 本文件由 `matrix-tools/scripts/gen_changelogs.py` 从 git 历史生成，按 tag 切段、取每段内的 conventional commit 渲染。
 
+## [v0.11.2] — 2026-11-11
+
+### 修复(worker)：Stop→Start 重启竞态 + 错误字段标准名（#103 #104）
+
+- #103 Stop 等满「done + quit」双信号：quit 在 running 清零后的最后一步关闭
+  （defer 注册最先 → 执行最后）。close(done)（finishCampaign 尾部）与
+  running 清零之间的窗口曾让 Stop 返回后紧接的 Start 命中 already_running
+  被静默吞掉——本副本不再参选、租约被他副本接管（#96 修复后的 defer 次序
+  残余竞态）。50 轮 Stop→Start 循环回归钉住
+- #104 worker 侧 5 处错误字段从手写 "error" 字面量改 logx.ErrKey（"err"）——
+  两矩阵落同一 Loki/ES，查询侧不再 OR 双写
+测试按 issue 号命名新增 2 条回归用例；go test -race 全绿。
+
+- 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.33.0
+
+| 依赖 | 现地板 | 抬到 |
+|---|---|---|
+| `github.com/oekit/concurrency` | `v0.32.0` | `v0.33.0` |
+## 为什么
+矩阵的**发版时刻地板时效**门禁（`verify_tag_floor --ref HEAD`）要求：各仓 HEAD
+（= 下次发版会发出去的内容）的依赖地板，相对那一刻的依赖最新版本，不能已落后。
+oekit 基座与矩阵模块都在高频发版 ⇒ 地板是**跑步机**，落后一格就会判红。
+## 兼容性实测
+本工具在提交前跑完 `go build` / `go vet` / `go test -race -count=1 ./...`（全绿才提交）
+与 `go mod tidy -diff`（无漂移）⇒ 改动**只影响依赖版本**，零行为差异。
+只改 `go.mod` / `go.sum` ⇒ 不需要 CHANGELOG 条目（版本段由下次发版的 `prewrite` 生成）。
+
+- 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.32.0
+
+| 依赖 | 现地板 | 抬到 |
+|---|---|---|
+| `github.com/oekit/concurrency` | `v0.31.2` | `v0.32.0` |
+| `github.com/oekit/logx` | `v0.9.1` | `v0.9.2` |
+## 为什么
+矩阵的**发版时刻地板时效**门禁（`verify_tag_floor --ref HEAD`）要求：各仓 HEAD
+（= 下次发版会发出去的内容）的依赖地板，相对那一刻的依赖最新版本，不能已落后。
+oekit 基座与矩阵模块都在高频发版 ⇒ 地板是**跑步机**，落后一格就会判红。
+## 兼容性实测
+本工具在提交前跑完 `go build` / `go vet` / `go test -race -count=1 ./...`（全绿才提交）
+与 `go mod tidy -diff`（无漂移）⇒ 改动**只影响依赖版本**，零行为差异。
+只改 `go.mod` / `go.sum` ⇒ 不需要 CHANGELOG 条目（版本段由下次发版的 `prewrite` 生成）。
+
+- 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.31.2
+
+| 依赖 | 现地板 | 抬到 |
+|---|---|---|
+| `github.com/oekit/concurrency` | `v0.31.1` | `v0.31.2` |
+| `github.com/oekit/logx` | `v0.9.0` | `v0.9.1` |
+## 为什么
+矩阵的**发版时刻地板时效**门禁（`verify_tag_floor --ref HEAD`）要求：各仓 HEAD
+（= 下次发版会发出去的内容）的依赖地板，相对那一刻的依赖最新版本，不能已落后。
+oekit 基座与矩阵模块都在高频发版 ⇒ 地板是**跑步机**，落后一格就会判红。
+## 兼容性实测
+本工具在提交前跑完 `go build` / `go vet` / `go test -race -count=1 ./...`（全绿才提交）
+与 `go mod tidy -diff`（无漂移）⇒ 改动**只影响依赖版本**，零行为差异。
+只改 `go.mod` / `go.sum` ⇒ 不需要 CHANGELOG 条目（版本段由下次发版的 `prewrite` 生成）。
+
+
 ## [v0.11.1] — 2026-11-10
 
 ### 修复(worker,sqlqueue)：选主重启状态机 / Pool panic 可恢复 / claim attempts 真实落库（#96 #97 #98）
@@ -172,21 +230,6 @@ Merge branch 'main' into fix/audit-issues-71-70-69
 
 
 ## [v0.10.2] — 2026-11-08
-
-- 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.28.4
-
-| 依赖 | 现地板 | 抬到 |
-|---|---|---|
-| `github.com/oekit/concurrency` | `v0.28.3` | `v0.28.4` |
-| `github.com/oekit/logx` | `v0.8.8` | `v0.8.10` |
-## 为什么
-矩阵的**发版时刻地板时效**门禁（`verify_tag_floor --ref HEAD`）要求：各仓 HEAD
-（= 下次发版会发出去的内容）的依赖地板，相对那一刻的依赖最新版本，不能已落后。
-oekit 基座与矩阵模块都在高频发版 ⇒ 地板是**跑步机**，落后一格就会判红。
-## 兼容性实测
-本工具在提交前跑完 `go build` / `go vet` / `go test -race -count=1 ./...`（全绿才提交）
-与 `go mod tidy -diff`（无漂移）⇒ 改动**只影响依赖版本**，零行为差异。
-只改 `go.mod` / `go.sum` ⇒ 不需要 CHANGELOG 条目（版本段由下次发版的 `prewrite` 生成）。
 
 - 杂务(deps)：依赖地板追平 oekit BOM v0.2.9——pkg v0.37.4 / logx v0.8.10 / concurrency v0.28.4
 
