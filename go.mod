@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/lib/pq v1.12.3
-	github.com/oekit/concurrency v0.32.0
+	github.com/oekit/concurrency v0.33.0
 	github.com/oekit/logx v0.9.2
 	modernc.org/sqlite v1.34.5
 )
