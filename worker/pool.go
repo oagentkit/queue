@@ -7,7 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -330,7 +330,7 @@ func (p *Pool) inflightSnapshot() []string {
 		ids = append(ids, id)
 	}
 	p.inflightMu.Unlock()
-	sort.Strings(ids)
+	slices.Sort(ids)
 	return ids
 }
 
