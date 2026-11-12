@@ -2,7 +2,7 @@
 
 > 本文件由 `matrix-tools/scripts/gen_changelogs.py` 从 git 历史生成，按 tag 切段、取每段内的 conventional commit 渲染。
 
-## [v0.11.4] — 2026-11-12
+## [v0.11.4] — 2026-11-13
 
 - 杂务：go 1.25+ 语言特性纯现代化——range-over-int / builtin max / wg.Go / slices.Sorted(maps.Keys) / slices.Contains（行为零变化）
 
