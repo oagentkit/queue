@@ -4,6 +4,20 @@
 
 ## [v0.11.4] — 2026-11-13
 
+- 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.34.1
+
+| 依赖 | 现地板 | 抬到 |
+|---|---|---|
+| `github.com/oekit/concurrency` | `v0.34.0` | `v0.34.1` |
+## 为什么
+矩阵的**发版时刻地板时效**门禁（`verify_tag_floor --ref HEAD`）要求：各仓 HEAD
+（= 下次发版会发出去的内容）的依赖地板，相对那一刻的依赖最新版本，不能已落后。
+oekit 基座与矩阵模块都在高频发版 ⇒ 地板是**跑步机**，落后一格就会判红。
+## 兼容性实测
+本工具在提交前跑完 `go build` / `go vet` / `go test -race -count=1 ./...`（全绿才提交）
+与 `go mod tidy -diff`（无漂移）⇒ 改动**只影响依赖版本**，零行为差异。
+只改 `go.mod` / `go.sum` ⇒ 不需要 CHANGELOG 条目（版本段由下次发版的 `prewrite` 生成）。
+
 - 杂务：go 1.25+ 语言特性纯现代化——range-over-int / builtin max / wg.Go / slices.Sorted(maps.Keys) / slices.Contains（行为零变化）
 
 - rangeint：ClaimNextPendingDetailed 重试轮、worker.Start 启动循环 for i := range p.N（p.N 循环期只读）；poison/issue_sweep/real_exec 等测试循环
