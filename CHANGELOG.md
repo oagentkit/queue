@@ -2,6 +2,18 @@
 
 > 本文件由 `matrix-tools/scripts/gen_changelogs.py` 从 git 历史生成，按 tag 切段、取每段内的 conventional commit 渲染。
 
+## [v0.11.4] — 2026-11-12
+
+- 杂务：go 1.25+ 语言特性纯现代化——range-over-int / builtin max / wg.Go / slices.Sorted(maps.Keys) / slices.Contains（行为零变化）
+
+- rangeint：ClaimNextPendingDetailed 重试轮、worker.Start 启动循环 for i := range p.N（p.N 循环期只读）；poison/issue_sweep/real_exec 等测试循环
+- minmax：WithMaxAttempts 收编 builtin max(n, 0)
+- waitgroupgo：leader_restart/sqllease/sqlqueue/claim_attempts_race 干净 Add(1)/go/Done fan-out 收编 wg.Go（pool.go 走 panicRunner.GoSafe 的不干净 fan-out 不动）
+- slices.Sorted(maps.Keys)：worker inflightSnapshot 续期集快照（调用方仅 len/透传，空集 nil 语义无观察点）
+- slices.Contains：mysql_quoting bareIdent 纯 == 词元查找
+- 不动项（保守跳过）：atomic.Int32 类型化 / t.Context() / errors.AsType（规则外）；pool.go guardedCall 的 errors.As 判 PanicError（规则外）；stop_timeout_log 子串扫描（非计数循环）
+
+
 ## [v0.11.3] — 2026-11-12
 
 - 杂务(deps)：依赖地板追到最新——github.com/oekit/pkg v0.46.0
