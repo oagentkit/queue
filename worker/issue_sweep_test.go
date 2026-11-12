@@ -48,7 +48,7 @@ func TestStopThenStartRestartsImmediately_Issue103(t *testing.T) {
 func TestStopThenStartLoop_Issue103(t *testing.T) {
 	e := newSweepElector(t)
 	ctx := context.Background()
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		e.Start(ctx)
 		if !awaitLeader(e, "当选") {
 			t.Fatalf("第 %d 轮应当选", i)

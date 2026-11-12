@@ -149,12 +149,10 @@ func TestLeaderElectorConcurrentStartSingleCampaign(t *testing.T) {
 	ctx := context.Background()
 
 	var wg sync.WaitGroup
-	for i := 0; i < 16; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 16 {
+		wg.Go(func() {
 			e.Start(ctx)
-		}()
+		})
 	}
 	wg.Wait()
 

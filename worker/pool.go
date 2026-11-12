@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -242,7 +243,7 @@ func (p *Pool) Start(ctx context.Context) {
 	p.inflightMu.Unlock()
 	atomic.StoreInt32(&p.liveWorkers, int32(p.N))
 	var wg sync.WaitGroup
-	for i := 0; i < p.N; i++ {
+	for i := range p.N {
 		wg.Add(1)
 		// worker 循环体 panic = 该 worker 死亡、池静默减员——panic 汇报收编
 		// 进组件 logger（与 claim_failed/task_panic 同一观测面；旧 async.GoSafe
@@ -325,12 +326,8 @@ func (p *Pool) trackDone(taskID string) {
 // inflightSnapshot 取续期集的稳定快照（排序：日志与 SQL 参数顺序可复现）。
 func (p *Pool) inflightSnapshot() []string {
 	p.inflightMu.Lock()
-	ids := make([]string, 0, len(p.inflight))
-	for id := range p.inflight {
-		ids = append(ids, id)
-	}
+	ids := slices.Sorted(maps.Keys(p.inflight))
 	p.inflightMu.Unlock()
-	slices.Sort(ids)
 	return ids
 }
 

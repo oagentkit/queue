@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -57,12 +58,7 @@ var (
 // key 当成本裸词，自证无效。
 func bareIdent(stmt, name string) bool {
 	clean := quotedSeg.ReplaceAllString(stmt, " ")
-	for _, m := range identRe.FindAllString(clean, -1) {
-		if m == name {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(identRe.FindAllString(clean, -1), name)
 }
 
 // TestMySQLStatementsQuoteReservedKey MySQL 方言下每条语句都必须引用 `key`

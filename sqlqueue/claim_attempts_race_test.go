@@ -30,7 +30,7 @@ func TestClaimAttemptsMatchesPersistedValueUnderResetRace(t *testing.T) {
 	s := testStore(t, "stress-runner")
 
 	const tasks = 4
-	for i := 0; i < tasks; i++ {
+	for i := range tasks {
 		if err := s.Enqueue(ctx, fmt.Sprintf("poison-%d", i)); err != nil {
 			t.Fatal(err)
 		}
@@ -57,9 +57,7 @@ func TestClaimAttemptsMatchesPersistedValueUnderResetRace(t *testing.T) {
 	// 心跳回拨：让 running 行随时处于「失联」状态——SQLite nowFn 是整秒
 	// 粒度，不回拨时复位只在秒边界成批触发，竞态窗口命中率过低。回拨方与
 	// 复位方解耦，复位即可常数命中。
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for {
 			select {
 			case <-stop:
@@ -69,13 +67,11 @@ func TestClaimAttemptsMatchesPersistedValueUnderResetRace(t *testing.T) {
 			_, _ = s.db.ExecContext(ctx,
 				`UPDATE agentkit_task SET heartbeat_at = heartbeat_at - 3600 WHERE status = 'running'`)
 		}
-	}()
+	})
 
 	// 复位方 ×2：把失联 running 行改回 pending（attempts+1）。
-	for r := 0; r < 2; r++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 2 {
+		wg.Go(func() {
 			for {
 				select {
 				case <-stop:
@@ -84,16 +80,14 @@ func TestClaimAttemptsMatchesPersistedValueUnderResetRace(t *testing.T) {
 				}
 				_, _ = s.ResetRunningToPending(ctx, 0)
 			}
-		}()
+		})
 	}
 
 	// 领取方 ×4：记录 reported 序列，断言严格递增。
 	const claimers = 4
 	var claims atomic.Int64
-	for c := 0; c < claimers; c++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range claimers {
+		wg.Go(func() {
 			for {
 				select {
 				case <-stop:
@@ -110,7 +104,7 @@ func TestClaimAttemptsMatchesPersistedValueUnderResetRace(t *testing.T) {
 				claims.Add(1)
 				record(id, reported)
 			}
-		}()
+		})
 	}
 
 	// 压测窗口：至少跑到出现足量 claim（正常路径每秒数千次），上限 5s。
