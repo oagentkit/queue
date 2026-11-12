@@ -145,11 +145,7 @@ func (s *Store) WithTable(name string) *Store {
 //
 // 建议宿主一律显式设 n（按 staleAfter 周期与业务可容忍重试轮数折算）。
 func (s *Store) WithMaxAttempts(n int) *Store {
-	if n > 0 {
-		s.maxAttempts = n
-	} else {
-		s.maxAttempts = 0
-	}
+	s.maxAttempts = max(n, 0)
 	return s
 }
 
@@ -208,7 +204,7 @@ func (s *Store) ClaimNextPending(ctx context.Context) (string, bool, error) {
 // 窗口时，本调用的守卫 UPDATE 仍然命中（行又变回 pending），返回值却比库内
 // 实际值少 2——毒任务闸门系统性偏低报、晚触发（queue#98）。
 func (s *Store) ClaimNextPendingDetailed(ctx context.Context) (string, int, bool, error) {
-	for i := 0; i < claimRetries; i++ {
+	for range claimRetries {
 		var candidate string
 		q := fmt.Sprintf(`SELECT task_id FROM %s WHERE status = '%s'
 ORDER BY created_at, task_id LIMIT 1`, s.table, StatusPending)

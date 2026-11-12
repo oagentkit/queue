@@ -24,7 +24,7 @@ func TestMaxAttemptsMeansRealExecutions(t *testing.T) {
 				t.Fatal(err)
 			}
 			runs := 0
-			for i := 0; i < 20; i++ {
+			for range 20 {
 				if !poisonCycle(t, ctx, s, "task-1") {
 					break
 				}

@@ -85,10 +85,8 @@ func TestConcurrentTryAcquireSingleWinner(t *testing.T) {
 	var mu sync.Mutex
 	winners := map[string]int{}
 	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
+	for i := range n {
+		wg.Go(func() {
 			holder := fmt.Sprintf("inst-%d", i)
 			ok, err := s.TryAcquire(ctx, "lead", holder, time.Minute)
 			if err != nil {
@@ -100,7 +98,7 @@ func TestConcurrentTryAcquireSingleWinner(t *testing.T) {
 				winners[holder]++
 				mu.Unlock()
 			}
-		}(i)
+		})
 	}
 	wg.Wait()
 	if len(winners) != 1 {
@@ -116,17 +114,15 @@ func TestConcurrentColdStart(t *testing.T) {
 	s := testStore(t)
 	var wg sync.WaitGroup
 	errs := make(chan error, 32)
-	for i := 0; i < 32; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
+	for i := range 32 {
+		wg.Go(func() {
 			ok, err := s.TryAcquire(ctx, "cold", fmt.Sprintf("i-%d", i), time.Minute)
 			if err != nil {
 				errs <- err
 				return
 			}
 			_ = ok
-		}(i)
+		})
 	}
 	wg.Wait()
 	close(errs)

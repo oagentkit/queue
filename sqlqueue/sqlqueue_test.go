@@ -144,10 +144,8 @@ func TestConcurrentClaimSingleWinner(t *testing.T) {
 	var mu sync.Mutex
 	wins := 0
 	var wg sync.WaitGroup
-	for i := 0; i < 16; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 16 {
+		wg.Go(func() {
 			_, ok, err := s.ClaimNextPending(ctx)
 			if err != nil {
 				t.Errorf("claim: %v", err)
@@ -158,7 +156,7 @@ func TestConcurrentClaimSingleWinner(t *testing.T) {
 				wins++
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if wins != 1 {
@@ -171,7 +169,7 @@ func TestConcurrentClaimDistributesAll(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t, "r")
 	const total = 32
-	for i := 0; i < total; i++ {
+	for i := range total {
 		if err := s.Enqueue(ctx, fmt.Sprintf("t%02d", i)); err != nil {
 			t.Fatal(err)
 		}
@@ -179,10 +177,8 @@ func TestConcurrentClaimDistributesAll(t *testing.T) {
 	var mu sync.Mutex
 	claimed := map[string]bool{}
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 8 {
+		wg.Go(func() {
 			for {
 				id, ok, err := s.ClaimNextPending(ctx)
 				if err != nil {
@@ -199,7 +195,7 @@ func TestConcurrentClaimDistributesAll(t *testing.T) {
 				claimed[id] = true
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if len(claimed) != total {

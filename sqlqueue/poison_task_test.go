@@ -98,7 +98,7 @@ func TestMaxAttemptsDeadLettersPoisonTask(t *testing.T) {
 	frozen := attemptsOf(t, ctx, s, "poison")
 
 	// 终态后退出重试循环：不再可领，复位/续期都不再碰它
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if poisonCycle(t, ctx, s, "poison") {
 			t.Fatalf("dead_letter 行不得再被领取（第 %d 轮）", i+4)
 		}
@@ -126,7 +126,7 @@ func TestZeroMaxAttemptsKeepsExistingBehavior(t *testing.T) {
 	if err := s.Enqueue(ctx, "poison"); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 6; i++ {
+	for i := range 6 {
 		if !poisonCycle(t, ctx, s, "poison") {
 			t.Fatalf("无上限时第 %d 轮应照旧重试（复位回 pending）", i+1)
 		}
@@ -146,7 +146,7 @@ func TestNegativeMaxAttemptsMeansNoCap(t *testing.T) {
 	if err := s.Enqueue(ctx, "poison"); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if !poisonCycle(t, ctx, s, "poison") {
 			t.Fatalf("负上限=不封顶，第 %d 轮应照旧重试", i+1)
 		}
