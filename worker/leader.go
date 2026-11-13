@@ -195,13 +195,18 @@ func NewLeaderElector(store LeaseStore, key, holder string, ttl, interval time.D
 	if interval >= ttl {
 		panic(fmt.Sprintf("worker: NewLeaderElector interval 必须小于 ttl（ttl=%v interval=%v）——续约节拍不短于租期时，租约在两次续约之间必然过期，其他副本可在本实例仍自认 leader 时接管（双主窗口，oagentkit/queue#36）", ttl, interval))
 	}
+	// 组件名取 AGENTS.md「日志」条与 matrix-tools/modules.json loggingRule 的
+	// **字面值** oagentkit-queue（#121）：此前的 oagentkit-leader 是按
+	// `oagentkit-<module>` 通配做的改名，与双契约字面不符——按字面名做
+	// 日志过滤/路由的下游查不到本组件日志；leader 细分由事件名
+	// （agentkit.leader.*）与结构化字段承载，不丢。
 	e := &LeaderElector{
 		store:    store,
 		key:      key,
 		holder:   holder,
 		ttl:      ttl,
 		interval: interval,
-		log:      logx.Delegating("oagentkit-leader"),
+		log:      logx.Delegating("oagentkit-queue"),
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
 	}

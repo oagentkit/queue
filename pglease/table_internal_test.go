@@ -34,13 +34,15 @@ func TestWithTable(t *testing.T) {
 // TestMigrateSQL 轻量校验 Migrate 语句形态（无 PG 时跳过集成）。
 func TestMigrateSQL(t *testing.T) {
 	// 无数据库连接时仅验证 SQL 构造不 panic；真 PG 集成见 DSN 门控测试。
-	s := NewPGLeaseStore(nil).WithTable("custom_lease")
+	// db 用零值 &sql.DB{} 而非 nil：#120 起构造器对 nil db fail-fast panic，
+	// 零值（非 nil）仍可走完构造与语句构造路径。
+	s := NewPGLeaseStore(&sql.DB{}).WithTable("custom_lease")
 	if s.table != "custom_lease" {
 		t.Fatal("table 未生效")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
-	// nil db 会 panic 或返回错误——这里只要求方法存在且签名正确。
+	// 零值 db 会 panic 或返回错误——这里只要求方法存在且签名正确。
 	defer func() { _ = recover() }()
 	_ = s.Migrate(ctx)
 }
