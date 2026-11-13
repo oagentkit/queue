@@ -33,8 +33,7 @@ func TestSlowCallbackDoesNotStallRenewal(t *testing.T) {
 			<-release // 模拟「回调做重活 / 等外部服务」
 		}),
 		WithLeaderLogger(logx.NewSlogLogger("test")))
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	a.Start(ctx)
 
 	select {
@@ -121,8 +120,7 @@ func TestCallbackPanicDoesNotKillDispatcher(t *testing.T) {
 		}),
 		WithOnLost(func() { lost.Add(1) }),
 		WithLeaderLogger(logx.NewSlogLogger("test")))
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	e.Start(ctx)
 
 	deadline := time.Now().Add(2 * time.Second)
