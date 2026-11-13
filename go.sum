@@ -10,8 +10,8 @@ github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWE
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
 github.com/ncruces/go-strftime v0.1.9 h1:bY0MQC28UADQmHmaF5dgpLmImcShSi2kHU9XLdhx/f4=
 github.com/ncruces/go-strftime v0.1.9/go.mod h1:Fwc5htZGVVkseilnfgOVb9mKy6w1naJmn9CehxcKcls=
-github.com/oekit/concurrency v0.35.0 h1:grAwBv5zRSR9sxm9R7EZqDVIDSUYJVBu9ir/E4ljsXc=
-github.com/oekit/concurrency v0.35.0/go.mod h1:zRGaMlEExLlCyBgLMQUc6eE12hDZo5HwU1aOtS4sP1U=
+github.com/oekit/concurrency v0.35.1 h1:v1uOyBmXSw0JOiN4KqO8Cou108Q60XPUmce0aKF/JoE=
+github.com/oekit/concurrency v0.35.1/go.mod h1:zRGaMlEExLlCyBgLMQUc6eE12hDZo5HwU1aOtS4sP1U=
 github.com/oekit/logx v0.10.0 h1:swoa1h9oLMdoH6LVjHaTYFIlVSxwRlfV0lBMNmKFfLI=
 github.com/oekit/logx v0.10.0/go.mod h1:hGifsM8pfOb8cR4KSmJE2j2oy3Q9KLEwKcfAgj+M/yY=
 github.com/oekit/pkg v0.47.1 h1:wZfDyJAhPEwEwUdweoD/KdrNRNYID3qgeblisFjEdU8=
