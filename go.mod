@@ -4,8 +4,8 @@ go 1.26.0
 
 require (
 	github.com/lib/pq v1.12.3
-	github.com/oekit/concurrency v0.35.1
-	github.com/oekit/logx v0.10.0
+	github.com/oekit/concurrency v0.36.0
+	github.com/oekit/logx v0.11.0
 	modernc.org/sqlite v1.34.5
 )
 
