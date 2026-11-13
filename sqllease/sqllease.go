@@ -103,7 +103,15 @@ type Store struct {
 }
 
 // New 构造（表名用 DefaultTable；WithTable 覆盖）。
+//
+// 构造期 fail-fast（panic，与 sqlqueue.New / worker.NewLeaderElector 同一道
+// 纪律，oagentkit/queue#69/#120）：nil db 是装配期语义破坏——nil *sql.DB
+// 只会把 panic 推迟到首次用语句的 goroutine（本包是常驻的租约轮询 goroutine，
+// 调用方毫无拦截机会），必须在构造期拦截。
 func New(db *sql.DB, dialect Dialect) *Store {
+	if db == nil {
+		panic("sqllease: New db 不能为 nil——nil *sql.DB 只会把 panic 推迟到首次用语句的 goroutine（常在后台的租约轮询里，调用方毫无拦截机会），必须在构造期拦截")
+	}
 	return &Store{db: db, dialect: dialect, table: DefaultTable}
 }
 

@@ -184,7 +184,10 @@ type Pool struct {
 
 func (p *Pool) logger() logx.Logger {
 	if p.Log == nil {
-		return logx.Delegating("oagentkit-worker")
+		// 组件名取 AGENTS.md「日志」条与 matrix-tools/modules.json loggingRule
+		// 的字面值 oagentkit-queue（#121），与 LeaderElector 默认 logger 同源；
+		// worker 细分由事件名（agentkit.worker.*）与结构化字段承载。
+		return logx.Delegating("oagentkit-queue")
 	}
 	return p.Log
 }
