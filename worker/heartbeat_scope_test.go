@@ -21,17 +21,17 @@ type scopedQueue struct {
 
 	mu      sync.Mutex
 	sets    [][]string
-	scopedN int32
-	blindN  int32
+	scopedN atomic.Int32
+	blindN  atomic.Int32
 }
 
 func (q *scopedQueue) TouchRunningHeartbeats(_ context.Context) error {
-	atomic.AddInt32(&q.blindN, 1)
+	q.blindN.Add(1)
 	return nil
 }
 
 func (q *scopedQueue) TouchHeartbeatsFor(_ context.Context, taskIDs []string) error {
-	atomic.AddInt32(&q.scopedN, 1)
+	q.scopedN.Add(1)
 	q.mu.Lock()
 	q.sets = append(q.sets, append([]string(nil), taskIDs...))
 	q.mu.Unlock()
@@ -88,7 +88,7 @@ func TestHeartbeatRenewsOnlyInflight(t *testing.T) {
 	if len(got) != 1 || got[0] != "t1" {
 		t.Fatalf("续期集 = %v, want [t1]（t2 已退出，必须移出）", got)
 	}
-	if n := atomic.LoadInt32(&q.blindN); n != 0 {
+	if n := q.blindN.Load(); n != 0 {
 		t.Fatalf("实现 ScopedHeartbeater 时不得再走盲续: blindN=%d", n)
 	}
 }
@@ -107,7 +107,7 @@ func TestHeartbeatSkipsEmptySet(t *testing.T) {
 	if n := q.setCount(); n != 0 {
 		t.Fatalf("空集不得调用 TouchHeartbeatsFor: 调用 %d 次", n)
 	}
-	if n := atomic.LoadInt32(&q.blindN); n != 0 {
+	if n := q.blindN.Load(); n != 0 {
 		t.Fatalf("不得退回盲续: blindN=%d", n)
 	}
 }
@@ -122,7 +122,7 @@ func TestHeartbeatFallsBackToBlind(t *testing.T) {
 	p.heartbeat()
 	p.trackDone("t1")
 
-	if n := atomic.LoadInt32(&q.heartbeatCalls); n != 1 {
+	if n := q.heartbeatCalls.Load(); n != 1 {
 		t.Fatalf("应走盲续一次: heartbeatCalls=%d", n)
 	}
 }
@@ -173,8 +173,7 @@ func TestPoolHeartbeatDuringRunAndAfter(t *testing.T) {
 		<-release
 		return nil
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	p.Start(ctx)
 	defer p.Stop(2 * time.Second)
 
@@ -193,7 +192,7 @@ func TestPoolHeartbeatDuringRunAndAfter(t *testing.T) {
 	if after := q.setCount(); after != before {
 		t.Fatalf("任务退出后心跳不得再续它: 调用次数 %d → %d", before, after)
 	}
-	if n := atomic.LoadInt32(&q.blindN); n != 0 {
+	if n := q.blindN.Load(); n != 0 {
 		t.Fatalf("实现 ScopedHeartbeater 时不得走盲续: blindN=%d", n)
 	}
 }

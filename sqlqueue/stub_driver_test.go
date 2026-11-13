@@ -29,7 +29,7 @@ type migRecStmt struct {
 }
 
 // migStubSeq 全局注册名序号：sql.Register 同名 panic，用例间不可重名。
-var migStubSeq int64
+var migStubSeq atomic.Int64
 
 func (d *migStubDriver) Open(string) (driver.Conn, error) { return &migStubConn{d: d}, nil }
 
@@ -92,7 +92,7 @@ func (r *migStubRows) Next(dest []driver.Value) error {
 func newMigStubDB(t *testing.T, dialect Dialect, count int64) (*sql.DB, *migStubDriver) {
 	t.Helper()
 	d := &migStubDriver{count: count}
-	name := fmt.Sprintf("sqlqueue_stub_%d", atomic.AddInt64(&migStubSeq, 1))
+	name := fmt.Sprintf("sqlqueue_stub_%d", migStubSeq.Add(1))
 	sql.Register(name, d)
 	db, err := sql.Open(name, "")
 	if err != nil {

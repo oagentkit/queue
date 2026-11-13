@@ -166,7 +166,7 @@ type Pool struct {
 	inflight   map[string]struct{} // 本进程正在执行的任务（心跳续期集，见 ScopedHeartbeater）
 	// liveWorkers 尚未退出的 worker goroutine 数（atomic）。只在停机超时
 	// 分支里被读——「还有几个没退出」是那条 Warn 唯一能给出的硬信息。
-	liveWorkers int32
+	liveWorkers atomic.Int32
 
 	mu         sync.Mutex // 保护 start/stop 生命周期状态
 	started    bool
@@ -244,7 +244,7 @@ func (p *Pool) Start(ctx context.Context) {
 	p.inflightMu.Lock()
 	p.inflight = make(map[string]struct{}, p.N)
 	p.inflightMu.Unlock()
-	atomic.StoreInt32(&p.liveWorkers, int32(p.N))
+	p.liveWorkers.Store(int32(p.N))
 	var wg sync.WaitGroup
 	for i := range p.N {
 		wg.Add(1)
@@ -253,7 +253,7 @@ func (p *Pool) Start(ctx context.Context) {
 		// 走全局兜底，组件视角不可见）
 		p.panicRunner("agentkit.worker.loop_panic").GoSafe(func() {
 			defer wg.Done()
-			defer atomic.AddInt32(&p.liveWorkers, -1)
+			defer p.liveWorkers.Add(-1)
 			p.loop(p.loopCtx, p.runCtx, i)
 		})
 	}
@@ -389,8 +389,7 @@ func (p *Pool) guardedCall(panicLog, failLog string, fn func(ctx context.Context
 		defer cancel()
 		return fn(ctx)
 	})
-	var pe *async.PanicError
-	if errors.As(err, &pe) {
+	if pe, ok := errors.AsType[*async.PanicError](err); ok {
 		// 文案与手搓 recover 版逐字一致（panic 值入文案；栈已随 Handler 落日志）
 		return fmt.Errorf("worker: queue panic: %v", pe.Value)
 	}
@@ -429,7 +428,7 @@ func (p *Pool) Stop(grace time.Duration) {
 				// 状态位仍置（Pool 单次生命周期，stopOnce 已消耗——泄漏的
 				// goroutine 没有救回来的路径），所以留痕是唯一诚实的做法。
 				log.Warn("agentkit.worker.stop_exit_timeout",
-					"stuck_workers", atomic.LoadInt32(&p.liveWorkers),
+					"stuck_workers", p.liveWorkers.Load(),
 					"workers", workers,
 					"waited", hardExitTimeout.String(),
 					"action", "worker 未在硬取消后退出（Run 不理会 ctx？），本 Pool 已标记 stopped，这些 goroutine 仍在运行")
@@ -505,8 +504,7 @@ func (p *Pool) claim(ctx context.Context) (taskID string, attempts int, ok bool,
 		}
 		return err
 	})
-	var pe *async.PanicError
-	if errors.As(err, &pe) {
+	if pe, ok := errors.AsType[*async.PanicError](err); ok {
 		err = fmt.Errorf("worker: queue panic: %v", pe.Value)
 	}
 	return taskID, attempts, ok, err
@@ -526,8 +524,7 @@ func (p *Pool) runTask(runCtx context.Context, id int, taskID string) {
 			"panic", r, "stack", string(stack))
 	}}.RunSafeErr(func() error { return p.Run(runCtx, taskID) })
 	if err != nil {
-		var pe *async.PanicError
-		if !errors.As(err, &pe) { // panic 已随 Handler 落 task_panic 日志
+		if _, ok := errors.AsType[*async.PanicError](err); !ok { // panic 已随 Handler 落 task_panic 日志
 			p.logger().Error("agentkit.worker.run_error", "worker", id, "task", taskID, logx.ErrKey, err.Error())
 		}
 	}

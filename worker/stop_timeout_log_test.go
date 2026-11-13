@@ -132,9 +132,9 @@ func TestStopWarnsWhenWorkerIgnoresContext(t *testing.T) {
 
 	// 放开后 worker 才真正退出——证明「未退出」这个判定当时是准的
 	deadline := time.Now().Add(5 * time.Second)
-	for atomic.LoadInt32(&p.liveWorkers) != 0 {
+	for p.liveWorkers.Load() != 0 {
 		if time.Now().After(deadline) {
-			t.Fatalf("超时：Run 返回后 worker 应退出，liveWorkers=%d", atomic.LoadInt32(&p.liveWorkers))
+			t.Fatalf("超时：Run 返回后 worker 应退出，liveWorkers=%d", p.liveWorkers.Load())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -172,7 +172,7 @@ type slowHeartbeatQueue struct {
 	entered  chan struct{}
 	release  chan struct{}
 	once     sync.Once
-	resetCnt int32
+	resetCnt atomic.Int32
 }
 
 func (q *slowHeartbeatQueue) ClaimNextPending(context.Context) (string, bool, error) {
@@ -186,7 +186,7 @@ func (q *slowHeartbeatQueue) TouchRunningHeartbeats(context.Context) error {
 }
 
 func (q *slowHeartbeatQueue) ResetRunningToPending(context.Context, time.Duration) (int64, error) {
-	atomic.AddInt32(&q.resetCnt, 1)
+	q.resetCnt.Add(1)
 	return 0, nil
 }
 

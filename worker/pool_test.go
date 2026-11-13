@@ -16,7 +16,7 @@ type mockQueue struct {
 	mu             sync.Mutex
 	pending        []string
 	claimed        []string
-	heartbeatCalls int32
+	heartbeatCalls atomic.Int32
 }
 
 func newMockQueue(taskIDs ...string) *mockQueue {
@@ -36,7 +36,7 @@ func (q *mockQueue) ClaimNextPending(_ context.Context) (string, bool, error) {
 }
 
 func (q *mockQueue) TouchRunningHeartbeats(_ context.Context) error {
-	atomic.AddInt32(&q.heartbeatCalls, 1)
+	q.heartbeatCalls.Add(1)
 	return nil
 }
 

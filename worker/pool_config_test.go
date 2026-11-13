@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -89,7 +88,7 @@ func TestPoolHeartbeatIntervalFieldDrivesLoop(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	p.Stop(2 * time.Second)
 
-	if got := atomic.LoadInt32(&q.heartbeatCalls); got < 2 {
+	if got := q.heartbeatCalls.Load(); got < 2 {
 		t.Fatalf("HeartbeatInterval=5ms 时 200ms 内应有多轮心跳，实得 %d——字段未驱动循环", got)
 	}
 }

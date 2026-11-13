@@ -28,7 +28,7 @@ type stubRecStmt struct {
 }
 
 // stubSeq 全局注册名序号：sql.Register 同名 panic，用例间不可重名。
-var stubSeq int64
+var stubSeq atomic.Int64
 
 func (d *stubArgsDriver) Open(string) (driver.Conn, error) { return &stubArgsConn{d: d}, nil }
 
@@ -72,7 +72,7 @@ func (c *stubArgsConn) QueryContext(_ context.Context, q string, args []driver.N
 func newStubStore(t *testing.T, dialect Dialect, affected int64) (*Store, *stubArgsDriver) {
 	t.Helper()
 	d := &stubArgsDriver{affected: affected}
-	name := fmt.Sprintf("sqllease_stubargs_%d", atomic.AddInt64(&stubSeq, 1))
+	name := fmt.Sprintf("sqllease_stubargs_%d", stubSeq.Add(1))
 	sql.Register(name, d)
 	db, err := sql.Open(name, "")
 	if err != nil {
