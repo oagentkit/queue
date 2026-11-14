@@ -2,6 +2,112 @@
 
 > 本文件由 `matrix-tools/scripts/gen_changelogs.py` 从 git 历史生成，按 tag 切段、取每段内的 conventional commit 渲染。
 
+## [v0.12.0] — 2026-11-14
+
+### 新增(outbox)：下沉 统一副作用 outbox 队列
+
+新增 outbox 子包：durable side-effect queue（先落库再执行、同键重入替换、
+失败退避、死信可见），机制面只收规格驱动的 worker，kind 规格表是宿主策略。
+与 sqlqueue 划界的三件套：
+- 同 (kind,key) 幂等 upsert（重入替换：载荷更新/状态回 pending/attempts
+  清零/死信复活），sqlqueue 的 task_id 主键重入即冲突；
+- not_before 延迟可见调度（claim 只取到期行），sqlqueue 无此列；
+- Later() 与 handler DeferError 的「推后 ≠ 失败」（不动 attempts）+
+  per-kind 退避规格表（Spec），退避公式单源调 oekit/concurrency/retry
+ .Backoff（Base·2^(n-1) 封顶）。
+存储三方言（PG/MySQL/SQLite）沿 sqlqueue Migrate 先例（#85 列宽护栏与
+DDL 同源、#87 MySQL information_schema 判存）；认领单语句 CAS + 命中后
+立即重读（#98 纪律）；stale 兜底回收崩溃遗留 running 行（回收 = 失败，
+达 MaxAttempts 进死信）；认领凭据 per-claim 随机 token，全部记账按 token
+守卫——同键重入替换执行中的行时，在途执行清账落空、新载荷重投
+（at-least-once，doc 钉死）。
+API 面：New/WithTable/WithStaleAfter/WithPollInterval/WithLogger、
+Register(Spec, Handler)、Enqueue/Later、Health、Migrate、Run；
+Defer/DeferError、ErrUnknownKind/ErrKeyTooLong、状态常量与 MaxKindLen/
+MaxKeyLen 导出供宿主直查与人工重驱。
+测试：sqlite 行为套件（upsert 替换、延迟可见、认领序、并发互斥、
+退避死信、推后不计失败、执行中重入保最新、旧认领失败作废、stale 兜底、
+panic 视同失败、装配闸门）+ 方言 SQL 快照矩阵（PG/MySQL/SQLite 构建器
+文本逐条钉住）+ 列宽/表名/选项闸门。-race 通过。
+
+### 修复(queue)：sqllease/pglease 构造器补 nil db fail-fast；worker 组件 logger 名对齐契约字面值
+
+- sqllease.New / pglease.NewPGLeaseStore 补构造期 nil db panic（#120，继承
+  sqlqueue.New / NewLeaderElector 的 #69 纪律），两包各配构造闸门测试
+- LeaderElector / Pool 默认 logger 组件名改为 AGENTS.md 与 modules.json
+  loggingRule 的字面值 oagentkit-queue（#121），细分由事件名承载；
+  worker 包加 Delegating 实参门禁测试
+
+- 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.36.0 → v0.36.1
+- 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.36.0
+
+| 依赖 | 现地板 | 抬到 |
+|---|---|---|
+| `github.com/oekit/concurrency` | `v0.35.1` | `v0.36.0` |
+| `github.com/oekit/logx` | `v0.10.0` | `v0.11.0` |
+## 为什么
+矩阵的**发版时刻地板时效**门禁（`verify_tag_floor --ref HEAD`）要求：各仓 HEAD
+（= 下次发版会发出去的内容）的依赖地板，相对那一刻的依赖最新版本，不能已落后。
+oekit 基座与矩阵模块都在高频发版 ⇒ 地板是**跑步机**，落后一格就会判红。
+## 兼容性实测
+本工具在提交前跑完 `go build` / `go vet` / `go test -race -count=1 ./...`（全绿才提交）
+与 `go mod tidy -diff`（无漂移）⇒ 改动**只影响依赖版本**，零行为差异。
+只改 `go.mod` / `go.sum` ⇒ 不需要 CHANGELOG 条目（版本段由下次发版的 `prewrite` 生成）。
+
+- 杂务(deps)：依赖地板追到最新——github.com/oekit/pkg v0.48.0
+
+| 依赖 | 现地板 | 抬到 |
+|---|---|---|
+| `github.com/oekit/pkg` | `v0.47.1` | `v0.48.0` |
+## 为什么
+矩阵的**发版时刻地板时效**门禁（`verify_tag_floor --ref HEAD`）要求：各仓 HEAD
+（= 下次发版会发出去的内容）的依赖地板，相对那一刻的依赖最新版本，不能已落后。
+oekit 基座与矩阵模块都在高频发版 ⇒ 地板是**跑步机**，落后一格就会判红。
+## 兼容性实测
+本工具在提交前跑完 `go build` / `go vet` / `go test -race -count=1 ./...`（全绿才提交）
+与 `go mod tidy -diff`（无漂移）⇒ 改动**只影响依赖版本**，零行为差异。
+只改 `go.mod` / `go.sum` ⇒ 不需要 CHANGELOG 条目（版本段由下次发版的 `prewrite` 生成）。
+
+- 杂务(deps)：依赖地板追到最新——concurrency v0.35.1 / pkg v0.47.1
+- 杂务(modernize)：二阶段收编 go fix 规则外建议（matrix-tools#213 queue 分片）
+
+- errors.As → errors.AsType：worker/pool.go 3 处 PanicError 提取
+- atomic 类型化：Pool.liveWorkers、mockQueue/scopedQueue/slowHeartbeatQueue 计数器 → atomic.Int32；sqllease/sqlqueue stubSeq → atomic.Int64
+- t.Context()：heartbeat_scope_test、leader_callback_test 3 处 defer cancel 形态
+- 跳过（无候选）：queue 全仓无 reflect.TypeOf，TypeFor 项落在 guardx
+- 门禁：gofmt 净、go build/vet -race test 全绿（go1.26 工具链亦 vet 通过）、golangci-lint 0 issues
+
+- 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.35.0
+
+| 依赖 | 现地板 | 抬到 |
+|---|---|---|
+| `github.com/oekit/concurrency` | `v0.34.1` | `v0.35.0` |
+| `github.com/oekit/pkg` | `v0.46.0` | `v0.47.1` |
+## 为什么
+矩阵的**发版时刻地板时效**门禁（`verify_tag_floor --ref HEAD`）要求：各仓 HEAD
+（= 下次发版会发出去的内容）的依赖地板，相对那一刻的依赖最新版本，不能已落后。
+oekit 基座与矩阵模块都在高频发版 ⇒ 地板是**跑步机**，落后一格就会判红。
+## 兼容性实测
+本工具在提交前跑完 `go build` / `go vet` / `go test -race -count=1 ./...`（全绿才提交）
+与 `go mod tidy -diff`（无漂移）⇒ 改动**只影响依赖版本**，零行为差异。
+只改 `go.mod` / `go.sum` ⇒ 不需要 CHANGELOG 条目（版本段由下次发版的 `prewrite` 生成）。
+
+- 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.34.1
+
+| 依赖 | 现地板 | 抬到 |
+|---|---|---|
+| `github.com/oekit/concurrency` | `v0.34.0` | `v0.34.1` |
+| `github.com/oekit/pkg` | `v0.46.0` | `v0.47.0` |
+## 为什么
+矩阵的**发版时刻地板时效**门禁（`verify_tag_floor --ref HEAD`）要求：各仓 HEAD
+（= 下次发版会发出去的内容）的依赖地板，相对那一刻的依赖最新版本，不能已落后。
+oekit 基座与矩阵模块都在高频发版 ⇒ 地板是**跑步机**，落后一格就会判红。
+## 兼容性实测
+本工具在提交前跑完 `go build` / `go vet` / `go test -race -count=1 ./...`（全绿才提交）
+与 `go mod tidy -diff`（无漂移）⇒ 改动**只影响依赖版本**，零行为差异。
+只改 `go.mod` / `go.sum` ⇒ 不需要 CHANGELOG 条目（版本段由下次发版的 `prewrite` 生成）。
+
+
 ## [v0.11.4] — 2026-11-13
 
 - 杂务(deps)：依赖地板追到最新——github.com/oekit/concurrency v0.34.1
