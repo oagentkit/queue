@@ -175,7 +175,7 @@ func TestPoolHeartbeatDuringRunAndAfter(t *testing.T) {
 	})
 	ctx := t.Context()
 	p.Start(ctx)
-	defer p.Stop(2 * time.Second)
+	defer func() { _ = p.Close(stopCtx(t, 2*time.Second)) }()
 
 	<-started // 任务已在 Run 内执行
 

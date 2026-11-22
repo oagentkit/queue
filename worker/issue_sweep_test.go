@@ -1,6 +1,6 @@
 package worker
 
-// 2026-11-11 issue 清零战回归测试（#103）：钉住 Stop→Start 重启竞态。
+// 2026-11-11 issue 清零战回归测试（#103）：钉住 Close→Start 重启竞态。
 
 import (
 	"context"
@@ -24,8 +24,8 @@ func awaitLeader(e *LeaderElector, msg string) bool {
 	return e.IsLeader()
 }
 
-// TestStopThenStartRestartsImmediately_Issue103 Stop 返回后立即 Start 必须成功
-// 重启竞选——Stop 等满「done + quit」双信号，close(done) 与 running 清零之间的
+// TestStopThenStartRestartsImmediately_Issue103 Close 返回后立即 Start 必须成功
+// 重启竞选——Close 等满「done + quit」双信号，close(done) 与 running 清零之间的
 // 窗口不再让 Start 命中 already_running 被静默吞掉。
 func TestStopThenStartRestartsImmediately_Issue103(t *testing.T) {
 	e := newSweepElector(t)
@@ -34,16 +34,16 @@ func TestStopThenStartRestartsImmediately_Issue103(t *testing.T) {
 	if !awaitLeader(e, "单副本应当选") {
 		t.Fatal("单副本应当选")
 	}
-	e.Stop()
-	// Stop 返回后立即 Start（原竞态窗口：GOMAXPROCS>1 时可现 already_running）。
+	_ = e.Close(context.Background())
+	// Close 返回后立即 Start（原竞态窗口：GOMAXPROCS>1 时可现 already_running）。
 	e.Start(ctx)
 	if !awaitLeader(e, "重启后必须重新参选") {
 		t.Fatal("Stop 后立即 Start 的副本必须重新参选（queue#103）")
 	}
-	e.Stop()
+	_ = e.Close(context.Background())
 }
 
-// TestStopThenStartLoop_Issue103 高频 Stop→Start 循环下重启恒生效
+// TestStopThenStartLoop_Issue103 高频 Close→Start 循环下重启恒生效
 // （放大原竞态窗口的触发面）。
 func TestStopThenStartLoop_Issue103(t *testing.T) {
 	e := newSweepElector(t)
@@ -53,11 +53,11 @@ func TestStopThenStartLoop_Issue103(t *testing.T) {
 		if !awaitLeader(e, "当选") {
 			t.Fatalf("第 %d 轮应当选", i)
 		}
-		e.Stop()
+		_ = e.Close(context.Background())
 		e.Start(ctx)
 		if !awaitLeader(e, "重启参选") {
 			t.Fatalf("第 %d 轮 Stop 后立即 Start 必须重新参选（queue#103）", i)
 		}
-		e.Stop()
+		_ = e.Close(context.Background())
 	}
 }

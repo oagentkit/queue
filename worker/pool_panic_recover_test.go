@@ -12,11 +12,11 @@ import (
 // Pool.Start 构造期 panic 的可恢复性（oagentkit/queue#97）。
 //
 // 缺陷形态（两条，同根）：Start 用手工配对的 Lock/Unlock（无 defer），比值闸门
-// panic 发生在 Unlock 之前 ⇒ 互斥量永久泄漏，此后 Start/Stop 全部卡死在
+// panic 发生在 Unlock 之前 ⇒ 互斥量永久泄漏，此后 Start/Close 全部卡死在
 // p.mu.Lock()——优雅停机永不返回，进程僵死；且 p.started 已在闸门前置位，
 // 源码注释承诺的「panic 后 Pool 未启动，修好字段还能再次 Start」两条都不成立。
 //
-// 修复后必须全部成立：panic 被捕获 → Stop 能返回 → 修好字段再 Start 真的
+// 修复后必须全部成立：panic 被捕获 → Close 能返回 → 修好字段再 Start 真的
 // 能拉起 worker 并处理任务（不是 already_started 的静默 no-op）。
 func TestPoolStartPanicLeavesPoolUsable(t *testing.T) {
 	q := newMockQueue("task-1")
@@ -43,11 +43,11 @@ func TestPoolStartPanicLeavesPoolUsable(t *testing.T) {
 		p.Start(context.Background())
 	}()
 
-	// [2] panic 之后 Stop 必须能返回——修复前 p.mu 永久锁着，Stop 永不返回
+	// [2] panic 之后 Close 必须能返回——修复前 p.mu 永久锁着，Close 永不返回
 	//（优雅停机被无限阻塞，配置错误退化成进程僵死）。
 	stopped := make(chan struct{})
 	go func() {
-		p.Stop(time.Second)
+		_ = p.Close(stopCtx(t, time.Second))
 		close(stopped)
 	}()
 	select {
@@ -86,5 +86,5 @@ func TestPoolStartPanicLeavesPoolUsable(t *testing.T) {
 		t.Fatal("再次 Start 后 worker 未领取任何任务——Start 未真正生效")
 	}
 
-	p.Stop(2 * time.Second)
+	_ = p.Close(stopCtx(t, 2*time.Second))
 }

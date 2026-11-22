@@ -10,7 +10,7 @@ import (
 	"github.com/oekit/logx"
 )
 
-// countingLeaseStore 给任意 LeaseStore 加 TryAcquire 计数——「Stop 之后
+// countingLeaseStore 给任意 LeaseStore 加 TryAcquire 计数——「Close 之后
 // 再 Start 是否重新参选」唯一可靠的观测面就是竞选对 TryAcquire 的真实调用
 // （IsLeader 恒 false 与「从未参选」无法区分，oagentkit/queue#96）。
 type countingLeaseStore struct {
@@ -34,10 +34,10 @@ func waitLeader(t *testing.T, e *LeaderElector, timeout time.Duration) {
 	}
 }
 
-// TestLeaderElectorRestartAfterStop 「Start → Stop → Start」必须重新参选
+// TestLeaderElectorRestartAfterStop 「Start → Close → Start」必须重新参选
 // （oagentkit/queue#96）。
 //
-// 缺陷形态：Start 的整个启动流程被 sync.Once 包住，Stop 之后 startOnce 已被
+// 缺陷形态：Start 的整个启动流程被 sync.Once 包住，Close 之后 startOnce 已被
 // 消耗 ⇒ 第二次 Start 的函数体一次都不执行——不拉起竞选 goroutine、不打
 // 日志、不返回错误。本实例从此永不竞争租约而调用方毫无感知（IsLeader=false
 // 与「从未启动」表象一致），排障时无法区分「已重启」与「被静默忽略」这两种
@@ -53,7 +53,7 @@ func TestLeaderElectorRestartAfterStop(t *testing.T) {
 
 	e.Start(ctx)
 	waitLeader(t, e, 2*time.Second)
-	e.Stop()
+	_ = e.Close(context.Background())
 	if e.IsLeader() {
 		t.Fatal("Stop 后 IsLeader 应为 false")
 	}
@@ -78,7 +78,7 @@ func TestLeaderElectorRestartAfterStop(t *testing.T) {
 	}
 
 	// 重启后的停机依然有效：租约让出、IsLeader 归 false。
-	e.Stop()
+	_ = e.Close(context.Background())
 	if e.IsLeader() {
 		t.Fatal("重启后再 Stop，IsLeader 应为 false")
 	}
@@ -102,7 +102,7 @@ func TestLeaderElectorRestartCycle(t *testing.T) {
 	for round := 1; round <= 5; round++ {
 		e.Start(ctx)
 		waitLeader(t, e, 2*time.Second)
-		e.Stop()
+		_ = e.Close(context.Background())
 		if e.IsLeader() {
 			t.Fatalf("第 %d 轮：Stop 后 IsLeader 应为 false", round)
 		}
@@ -136,7 +136,7 @@ func TestLeaderElectorRestartAfterContextCancel(t *testing.T) {
 	if store.acquires.Load() <= before {
 		t.Fatal("ctx 取消退出后再 Start 未重新参选（startOnce 被首次 Start 消耗）")
 	}
-	e.Stop()
+	_ = e.Close(context.Background())
 }
 
 // TestLeaderElectorConcurrentStartSingleCampaign 并发重复 Start：只允许一个
@@ -157,7 +157,7 @@ func TestLeaderElectorConcurrentStartSingleCampaign(t *testing.T) {
 	wg.Wait()
 
 	waitLeader(t, e, 2*time.Second)
-	e.Stop()
+	_ = e.Close(context.Background())
 	if e.IsLeader() {
 		t.Fatal("并发 Start 后 Stop，IsLeader 应为 false")
 	}

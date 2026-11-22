@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -102,7 +103,7 @@ func stuckPool(t *testing.T, h *captureHandler) (p *Pool, started <-chan struct{
 
 // TestStopWarnsWhenWorkerIgnoresContext 硬取消后仍未退出必须留痕（#40）。
 //
-// 修复前的形态是**静默遗弃**：分支体为空，Stop 照样置 stopped 并打 Info
+// 修复前的形态是**静默遗弃**：分支体为空，Close 照样置 stopped 并打 Info
 // 「stopped」，运维读到的是「干净停机」，而 goroutine 与任务都还在跑。
 func TestStopWarnsWhenWorkerIgnoresContext(t *testing.T) {
 	withShortHardExit(t)
@@ -111,7 +112,9 @@ func TestStopWarnsWhenWorkerIgnoresContext(t *testing.T) {
 
 	p.Start(context.Background())
 	<-started
-	p.Stop(20 * time.Millisecond) // grace 内排不空 ⇒ 走硬取消 ⇒ 兜底超时
+	if err := p.Close(stopCtx(t, 20*time.Millisecond)); !errors.Is(err, ErrWorkersStuck) {
+		t.Fatalf("硬取消后 worker 未退出，Close 必须返回 ErrWorkersStuck，实为 %v", err)
+	}
 	unblock()
 
 	if rec, ok := h.find("stop_exit_timeout"); !ok {
@@ -154,7 +157,7 @@ func TestStopCleanDrainDoesNotWarn(t *testing.T) {
 	}
 	p.Start(context.Background())
 	time.Sleep(50 * time.Millisecond) // 让任务被领走并跑完（唯一需要等的时序）
-	p.Stop(2 * time.Second)
+	_ = p.Close(stopCtx(t, 2*time.Second))
 
 	if _, ok := h.find("stop_exit_timeout"); ok {
 		t.Errorf("正常排空不得打 stop_exit_timeout，实际日志: %v", h.messages())
@@ -193,7 +196,7 @@ func (q *slowHeartbeatQueue) ResetRunningToPending(context.Context, time.Duratio
 // TestStopWarnsWhenHeartbeatRoundStuck 心跳轮次卡住时同样必须留痕。
 //
 // 这是 #40 同一函数里**同形**的另一处静默分支（hbDone 等待）。一起修的理由：
-// 两处的失效形态逐字相同——Stop 返回、打 Info「stopped」、goroutine 还在跑。
+// 两处的失效形态逐字相同——Close 返回、打 Info「stopped」、goroutine 还在跑。
 func TestStopWarnsWhenHeartbeatRoundStuck(t *testing.T) {
 	withShortHardExit(t)
 
@@ -217,7 +220,7 @@ func TestStopWarnsWhenHeartbeatRoundStuck(t *testing.T) {
 		t.Fatal("超时：心跳轮次应已开始")
 	}
 	// 无在飞任务 ⇒ worker 很快退出 ⇒ 不进 grace_exceeded，直接走到停心跳
-	p.Stop(2 * time.Second)
+	_ = p.Close(stopCtx(t, 2*time.Second))
 
 	rec, ok := h.find("stop_heartbeat_timeout")
 	if !ok {

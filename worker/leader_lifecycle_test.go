@@ -8,13 +8,13 @@ import (
 	"github.com/oekit/logx"
 )
 
-// TestLeaderElectorStartAfterStopBeforeStart 「Start 之前误调一次 Stop」不得
+// TestLeaderElectorStartAfterStopBeforeStart 「Start 之前误调一次 Close」不得
 // 让选主器静默砖化（queue#37）。
 //
-// 旧实现 Stop 无条件 close(e.stop)：startOnce 与 stop 一起被烧掉，之后 Start
+// 旧实现 Close 无条件 close(e.stop)：startOnce 与 stop 一起被烧掉，之后 Start
 // 的竞选 goroutine 首个 tick 即 stopping()==true 直接退出 —— 永不参选、
-// IsLeader() 恒 false、无日志无错误。这与 Pool.Stop 的「未启动时 no-op，
-// 真正的 Stop 依然有效」语义相反。
+// IsLeader() 恒 false、无日志无错误。这与 Pool.Close 的「未启动时 no-op，
+// 真正的 Close 依然有效」语义相反。
 func TestLeaderElectorStartAfterStopBeforeStart(t *testing.T) {
 	store := newMemLeaseStore()
 	gained := make(chan struct{}, 1)
@@ -28,7 +28,7 @@ func TestLeaderElectorStartAfterStopBeforeStart(t *testing.T) {
 		WithLeaderLogger(logx.NewSlogLogger("test")))
 
 	// 误调用：此时从未 Start。
-	e.Stop()
+	_ = e.Close(context.Background())
 
 	e.Start(context.Background())
 
@@ -42,8 +42,8 @@ func TestLeaderElectorStartAfterStopBeforeStart(t *testing.T) {
 		t.Fatal("当选后 IsLeader 应为 true")
 	}
 
-	// 之后真正的 Stop 依然有效：等到退出且租约已让出。
-	e.Stop()
+	// 之后真正的 Close 依然有效：等到退出且租约已让出。
+	_ = e.Close(context.Background())
 	if e.IsLeader() {
 		t.Fatal("Stop 后 IsLeader 应为 false")
 	}
@@ -55,8 +55,8 @@ func TestLeaderElectorStartAfterStopBeforeStart(t *testing.T) {
 	}
 }
 
-// TestLeaderElectorStopIdempotentAfterStart Start 之后的重复 Stop 仍是幂等：
-// 已停机后再次 Stop 不得挂死在 <-e.done 上。
+// TestLeaderElectorStopIdempotentAfterStart Start 之后的重复 Close 仍是幂等：
+// 已停机后再次 Close 不得挂死在 <-e.done 上。
 func TestLeaderElectorStopIdempotentAfterStart(t *testing.T) {
 	store := newMemLeaseStore()
 	e := NewLeaderElector(store, "poller", "A", time.Minute, 10*time.Millisecond,
@@ -71,10 +71,10 @@ func TestLeaderElectorStopIdempotentAfterStart(t *testing.T) {
 		t.Fatal("超时：未当选")
 	}
 
-	e.Stop()
+	_ = e.Close(context.Background())
 	done := make(chan struct{})
 	go func() {
-		e.Stop()
+		_ = e.Close(context.Background())
 		close(done)
 	}()
 	select {
