@@ -57,12 +57,12 @@ func TestSlowCallbackDoesNotStallRenewal(t *testing.T) {
 	}
 
 	close(release)
-	a.Stop()
+	a.Close(context.Background())
 }
 
 // TestStopWaitsForCallbacksToDrain done 的含义包含「已入队的回调都跑过了」：
-// Stop 返回后在飞回调必须已经完成，否则调用方读到的组件状态仍是旧的
-// （「还没收到 onGained」），而它指望 Stop 保证的正是这件事。
+// Close 返回后在飞回调必须已经完成，否则调用方读到的组件状态仍是旧的
+// （「还没收到 onGained」），而它指望 Close 保证的正是这件事。
 //
 // 这条不是 #41 的判别式（同步实现下它同样成立），它钉的是改异步之后
 // **别把等待一起丢掉**。
@@ -86,7 +86,7 @@ func TestStopWaitsForCallbacksToDrain(t *testing.T) {
 		t.Fatal("超时：未当选")
 	}
 
-	e.Stop()
+	e.Close(context.Background())
 	if !drained.Load() {
 		t.Fatal("Stop 返回时在飞回调尚未跑完——done 失去了「回调已排空」的含义")
 	}
@@ -141,5 +141,5 @@ func TestCallbackPanicDoesNotKillDispatcher(t *testing.T) {
 	if lost.Load() == 0 {
 		t.Fatal("超时：失主后 onLost 未送达——调度器已被上一次回调的 panic 打死")
 	}
-	e.Stop()
+	e.Close(context.Background())
 }

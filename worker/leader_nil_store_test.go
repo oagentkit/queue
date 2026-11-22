@@ -30,6 +30,6 @@ func TestNewLeaderElectorRejectsNilStore(t *testing.T) {
 	e := NewLeaderElector(newMemLeaseStore(), "k", "h", time.Second, 100*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	e.Start(ctx)
-	e.Stop()
+	e.Close(context.Background())
 	cancel()
 }

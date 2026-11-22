@@ -120,16 +120,16 @@ type LeaderElector struct {
 
 	mu          sync.Mutex
 	leader      bool
-	everStarted bool          // Start 是否被调用过（Stop 是否该动手，queue#37）
+	everStarted bool          // Start 是否被调用过（Close 是否该动手，queue#37）
 	running     bool          // 竞选 goroutine 在跑（生命周期状态机，queue#96）
-	stopClosed  bool          // 本生命周期是否已关闭 stop（Stop 幂等的门，替代 stopOnce——Once 无法随生命周期重置）
-	stop        chan struct{} // Stop 请求信号
-	// done 竞选定稿且回调已排空（限时）后关闭——Stop 等它，故「Stop 返回」
+	stopClosed  bool          // 本生命周期是否已关闭 stop（Close 幂等的门，替代 stopOnce——Once 无法随生命周期重置）
+	stop        chan struct{} // Close 请求信号
+	// done 竞选定稿且回调已排空（限时）后关闭——Close 等它，故「Close 返回」
 	// 同时意味着「不再翻转角色」与「已入队的回调都跑过了」。
 	// done 与 quit 是两个信号（queue#103）：close(done)（finishCampaign 尾部）
-	// 先于 running 清零（defer LIFO），Stop 只等 done 会在 running 仍为 true
+	// 先于 running 清零（defer LIFO），Close 只等 done 会在 running 仍为 true
 	// 时返回——紧接的 Start 命中 already_running 被静默吞掉，本副本不再参选。
-	// quit 在 running 清零后的最后一步关闭，Stop 等满双信号。
+	// quit 在 running 清零后的最后一步关闭，Close 等满双信号。
 	done   chan struct{}
 	quit   chan struct{} // running 清零后的收尾信号（queue#103）
 	cbCh   chan func()   // 角色翻转回调队列：竞选 goroutine 是唯一写者
@@ -142,7 +142,7 @@ type LeaderOption func(*LeaderElector)
 // WithOnGained 获得领导权回调（首次当选与失而复得均触发）。
 func WithOnGained(f func()) LeaderOption { return func(e *LeaderElector) { e.onGained = f } }
 
-// WithOnLost 失去领导权回调（续约失败；Stop 主动让位不触发——那是计划内交接）。
+// WithOnLost 失去领导权回调（续约失败；Close 主动让位不触发——那是计划内交接）。
 func WithOnLost(f func()) LeaderOption { return func(e *LeaderElector) { e.onLost = f } }
 
 // WithLeaderLogger 日志（nil 安全，缺省静默）。
@@ -217,11 +217,11 @@ func NewLeaderElector(store LeaseStore, key, holder string, ttl, interval time.D
 }
 
 // Start 启动竞选循环：立即竞争一次（缩短冷启动等待），此后按 interval 续约。
-// ctx 取消或 Stop() 退出；退出前若持有租约则主动让位（计划内交接，不触发 onLost）。
+// ctx 取消或 Close 退出；退出前若持有租约则主动让位（计划内交接，不触发 onLost）。
 // 竞选进行中的重复调用为 no-op（只允许一个竞选 goroutine）。
 //
-// Stop（或 ctx 取消）之后再 Start 会**重建竞选 goroutine、重新参选**
-// （oagentkit/queue#96）：启动流程曾被 startOnce 包住，Stop 消耗 Once 之后
+// Close（或 ctx 取消）之后再 Start 会**重建竞选 goroutine、重新参选**
+// （oagentkit/queue#96）：启动流程曾被 startOnce 包住，Close 消耗 Once 之后
 // 第二次 Start 的函数体一次都不执行——不拉起 goroutine、无日志无错误，选主器
 // 被静默砖化（其他副本接管租约，本实例自以为还在参选）。改为显式状态机
 // （running/stopClosed + 锁）：同一时刻至多一条生命周期，退出后 Start 开新
@@ -238,10 +238,10 @@ func (e *LeaderElector) Start(ctx context.Context) {
 		e.log.Warn("agentkit.leader.start_ignored", "key", e.key, "reason", "already_running")
 		return
 	}
-	// everStarted 同步置位（在拉起 goroutine 之前）：Stop 若在 goroutine
+	// everStarted 同步置位（在拉起 goroutine 之前）：Close 若在 goroutine
 	// 尚未起来时读到 false 会直接返回，既不等待也不让位，租约泄漏。
 	//
-	// 置位与 Stop 的读在同一把锁内：否则存在「Stop 读到 false 当成未启动
+	// 置位与 Close 的读在同一把锁内：否则存在「Close 读到 false 当成未启动
 	// no-op，Start 紧接着照常参选」的窗口——调用方以为已停机，选主器还在跑。
 	restarted := e.everStarted
 	e.everStarted = true
@@ -274,12 +274,12 @@ func (e *LeaderElector) Start(ctx context.Context) {
 	// select 消费同一个显式传入的 ctx
 	async.GoWithContext(ctx, func(ctx context.Context) {
 		// defer LIFO——退出收尾次序有讲究（queue#96）：先 finishCampaign
-		// （封回调队列 → 排空 → 关 done，Stop 的等待点由此解除），**最后**
+		// （封回调队列 → 排空 → 关 done，Close 的等待点由此解除），**最后**
 		// 清 running。running 清零是本 goroutine 的最后一步：Start 的重启
 		// 分支只可能在它之后替换通道组，旧生命周期的 tick/yield/回调入队
 		// 因此绝不会摸到新一轮的 stop/cbCh。
 		// quit 信号（queue#103）：注册最先 → 执行最后（在 running 清零之后
-		// 关闭）——Stop 等满「done + quit」双信号才返回，不再有「close(done)
+		// 关闭）——Close 等满「done + quit」双信号才返回，不再有「close(done)
 		// 与 running 清零之间」的窗口让紧接的 Start 被静默吞掉。
 		defer close(quitCh)
 		defer func() {
@@ -319,41 +319,49 @@ func (e *LeaderElector) IsLeader() bool {
 	return e.leader
 }
 
-// Stop 停止竞选并主动让位（幂等；优雅停机的计划内交接，不触发 onLost）。
-// 等待竞选 goroutine 退出后返回——返回后 IsLeader 必为 false 且租约已让出。
-// Start 未被调用时立即返回（无租约可让），且**不消耗停机状态**：此后 Start
-// 依然能正常参选，之后真正的 Stop 也依然有效。停机完成后再次 Start 可重启
-// 竞选（oagentkit/queue#96，状态机语义见 Start 文档）。
+// Close 停止竞选并主动让位（幂等；优雅停机的计划内交接，不触发 onLost）。
+// 正常路径（ctx 未先取消）等待竞选 goroutine 退出后返回——返回后 IsLeader
+// 必为 false 且租约已让出。ctx 先期取消（deadline 到期或调用方放弃等待）时
+// 返回 ctx.Err()，让位动作仍在后台完成、不中断——此后 IsLeader 可能短暂
+// 仍为 true，调用方需知晓这个窗口。Start 未被调用时立即返回 nil（无租约可
+// 让），且**不消耗停机状态**：此后 Start 依然能正常参选，之后真正的 Close
+// 也依然有效。停机完成后再次 Start 可重启竞选（oagentkit/queue#96，状态机
+// 语义见 Start 文档）。
 //
 // 「不消耗停机状态」是本方法需要小心的地方（oagentkit/queue#37）：曾无条件
-// `close(e.stop)`，于是「Start 之前误调一次 Stop」就把 startOnce 与 stop 一起
+// `close(e.stop)`，于是「Start 之前误调一次 Close」就把 startOnce 与 stop 一起
 // 烧掉——之后的 Start 其竞选 goroutine 首个 tick 即 stopping()==true 直接退出，
 // 选主器永不参选、IsLeader() 恒 false，无日志无错误。这是「误调用一次即静默
-// 砖化」，与 Pool.Stop 的「未启动时 no-op，真正的 Stop 依然有效」语义相反。
-func (e *LeaderElector) Stop() {
+// 砖化」，与 Pool.Close 的「未启动时 no-op，真正的 Close 依然有效」语义相反。
+func (e *LeaderElector) Close(ctx context.Context) error {
 	e.mu.Lock()
 	if !e.everStarted {
 		// 未启动：no-op，不关闭 e.stop（关闭即砖化后续的 Start）
 		e.mu.Unlock()
-		return
+		return nil
 	}
-	// done 必须与 close(stop) 在同一把锁内捕获：Stop 的等待目标必须是**自己
-	// 停掉的这一轮生命周期**——否则 Stop 与 Start（重启）并发时，重启已把
-	// e.done 换成新一轮的通道，本 Stop 会挂在新轮的 done 上等一个不该由
+	// done 必须与 close(stop) 在同一把锁内捕获：Close 的等待目标必须是**自己
+	// 停掉的这一轮生命周期**——否则 Close 与 Start（重启）并发时，重启已把
+	// e.done 换成新一轮的通道，本 Close 会挂在新轮的 done 上等一个不该由
 	// 它等的结果。
 	// quit 同锁捕获（queue#103）：done 关闭（finishCampaign 尾部）早于
-	// running 清零（defer LIFO），只等 done 的 Stop 在窗口内返回后，紧接的
+	// running 清零（defer LIFO），只等 done 的 Close 在窗口内返回后，紧接的
 	// Start 命中 already_running 被静默吞掉（本副本不再参选、租约被他副本
 	// 接管）。等满「done + quit」双信号：quit 在 running 清零后的最后一步
-	// 关闭，Stop 返回即重启安全。
+	// 关闭，Close 正常返回即重启安全。
 	done, quit := e.done, e.quit
 	if !e.stopClosed {
 		close(e.stop)
 		e.stopClosed = true
 	}
 	e.mu.Unlock()
-	<-done
-	<-quit
+	select {
+	case <-done:
+		<-quit
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // stopping 已请求停止。
@@ -369,7 +377,7 @@ func (e *LeaderElector) stopping() bool {
 // releaseTimeout 让位释放租约的限时（独立 Background ctx：原 ctx 往往已取消）。
 const releaseTimeout = 5 * time.Second
 
-// acquireTimeout 竞选 TryAcquire 的单次限时（存储挂起时 Stop 不至于无界）。
+// acquireTimeout 竞选 TryAcquire 的单次限时（存储挂起时 Close 不至于无界）。
 const acquireTimeout = 5 * time.Second
 
 // callbackQueue 角色翻转回调队列容量。**只装翻转事件**：稳定复用期间一个 tick
@@ -378,7 +386,7 @@ const acquireTimeout = 5 * time.Second
 const callbackQueue = 64
 
 // callbackDrainTimeout 停机时等待回调排空的限时：回调是通知，不是停机屏障，
-// 卡死的回调不能把 Stop 拖成无界等待。
+// 卡死的回调不能把 Close 拖成无界等待。
 const callbackDrainTimeout = 5 * time.Second
 
 // releaseLease 主动释放租约（计划内交接）：失败仅 Warn——租约 ttl 到期会自然失效，
@@ -393,12 +401,12 @@ func (e *LeaderElector) releaseLease() {
 
 // tick 竞争一次租约。返回 false = 竞选应终止（已停止或 ctx 取消）。
 func (e *LeaderElector) tick(ctx context.Context) bool {
-	// 停止/取消后不再发起新的竞争：避免"Stop 之后新获得租约"的让位遗漏
+	// 停止/取消后不再发起新的竞争：避免"Close 之后新获得租约"的让位遗漏
 	if e.stopping() || ctx.Err() != nil {
 		return false
 	}
 	// 独立限时（继承 caller ctx 保留父取消语义）：存储层挂起（连接池耗尽/
-	// 网络分区）时 Stop 不至于永久阻塞在 <-e.done——与 releaseTimeout 同口径
+	// 网络分区）时 Close 不至于永久阻塞在 <-e.done——与 releaseTimeout 同口径
 	acquireCtx, cancel := context.WithTimeout(ctx, acquireTimeout)
 	defer cancel()
 	ok, err := e.store.TryAcquire(acquireCtx, e.key, e.holder, e.ttl)
@@ -418,7 +426,7 @@ func (e *LeaderElector) tick(ctx context.Context) bool {
 		return true
 	}
 	if ok && e.stopping() {
-		// Stop 与 TryAcquire 穿插：刚获得的租约立即让位，不宣布当选
+		// Close 与 TryAcquire 穿插：刚获得的租约立即让位，不宣布当选
 		e.releaseLease()
 		return false
 	}
@@ -444,9 +452,9 @@ func (e *LeaderElector) yield() {
 // 等字段已被新一轮 Start 换掉，收尾必须关自己那一轮的通道而不是字段里的
 // 新通道（oagentkit/queue#96）。
 //
-// 顺序有含义：done 是 Stop 唯一的等待点，所以它必须表示「不再翻转角色**且**
-// 已入队的回调都跑过了」——否则调用方在 Stop 之后读到的组件状态仍是「还没收到
-// onLost」的旧值，而那正是它指望 Stop 保证的事。
+// 顺序有含义：done 是 Close 唯一的等待点，所以它必须表示「不再翻转角色**且**
+// 已入队的回调都跑过了」——否则调用方在 Close 之后读到的组件状态仍是「还没收到
+// onLost」的旧值，而那正是它指望 Close 保证的事。
 func (e *LeaderElector) finishCampaign(cbCh chan func(), cbDone, done chan struct{}) {
 	// 本 goroutine 是 cbCh 的唯一写者（setLeader 只从 tick 里调），
 	// 故此处 close 不会与入队撞上。
@@ -456,7 +464,7 @@ func (e *LeaderElector) finishCampaign(cbCh chan func(), cbDone, done chan struc
 	case <-time.After(callbackDrainTimeout):
 		e.log.Warn("agentkit.leader.callback_drain_timeout",
 			"key", e.key, "waited", callbackDrainTimeout.String(),
-			"action", "角色翻转回调未在限期内返回，Stop 不再等它——回调 goroutine 仍在运行，其组件状态可能滞后")
+			"action", "角色翻转回调未在限期内返回，Close 不再等它——回调 goroutine 仍在运行，其组件状态可能滞后")
 	}
 	close(done)
 }
@@ -498,7 +506,7 @@ func (e *LeaderElector) setLeader(v bool) {
 	e.mu.Lock()
 	if e.stopping() {
 		// 已停机：yield 负责让位，此处不再变更状态/触发回调
-		// （避免 Stop 之后才触发 onGained，或让位后误触发 onLost）
+		// （避免 Close 之后才触发 onGained，或让位后误触发 onLost）
 		e.leader = false
 		e.mu.Unlock()
 		return

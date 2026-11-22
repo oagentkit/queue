@@ -31,7 +31,7 @@ const (
 )
 
 // hardExitTimeout 停机第二段/心跳等待的兜底：超过即认定对方不理会 ctx，
-// 打 Warn 留痕后继续收尾（不能因为一个卡死的 goroutine 让 Stop 永不返回）。
+// 打 Warn 留痕后继续收尾（不能因为一个卡死的 goroutine 让 Close 永不返回）。
 //
 // 用 var 不用 const：用例要把 10s 压到毫秒级才能验到那条 Warn，否则单个
 // 用例固定烧 10s。除测试外无人改它。
@@ -57,7 +57,7 @@ var hardExitTimeout = 10 * time.Second
 //     staleAfter 且心跳同步失败时，重置会在任务仍在跑时发生（长 LLM 调用、
 //     大批量导出、跨网段部署的宿主必须调大它；心跳在跑 = 存活信号，实现方
 //     不得只在任务结束时写）；
-//   - 优雅停机（Pool.Stop 的 grace 排水）窗口内**心跳继续续期**：Pool 用
+//   - 优雅停机（Pool.Close 的 grace 排水）窗口内**心跳继续续期**：Pool 用
 //     独立于 loopCtx 的 hbCtx 驱动心跳 goroutine（排水中任务仍活着，不该
 //     被他副本判失联接管——自实现的排水逻辑要保住同一承诺）；
 //   - ClaimNextPending 的状态迁移必须单语句原子（WHERE status='pending'
@@ -170,7 +170,7 @@ type Pool struct {
 
 	mu         sync.Mutex // 保护 start/stop 生命周期状态
 	started    bool
-	stopped    bool // Stop 置位：单次生命周期（二次 Start 与 Stop 后 Start 都 no-op）
+	stopped    bool // Close 置位：单次生命周期（二次 Start 与 Close 后 Start 都 no-op）
 	loopCtx    context.Context
 	runCtx     context.Context
 	hbCtx      context.Context // 心跳独立于 loopCtx：排空窗口内任务仍需续期
@@ -179,7 +179,8 @@ type Pool struct {
 	cancelHB   context.CancelFunc
 	done       chan struct{} // 全部 worker 退出后关闭
 	hbDone     chan struct{} // 心跳 goroutine 退出后关闭
-	stopOnce   sync.Once
+	closeOnce  sync.Once     // Close 幂等门；closeErr 记录首次有效停机的结果供重复调用取回
+	closeErr   error
 }
 
 func (p *Pool) logger() logx.Logger {
@@ -196,7 +197,7 @@ func (p *Pool) logger() logx.Logger {
 //
 // 比值闸门（HeartbeatInterval >= StaleAfter）panic 后 Pool 保持**未启动**：
 // 闸门在置 started 之前判定，且锁经 defer 释放（oagentkit/queue#97）——
-// 修复前手工配对的 Unlock 被 panic 跳过，互斥量永久泄漏（Start/Stop 全部
+// 修复前手工配对的 Unlock 被 panic 跳过，互斥量永久泄漏（Start/Close 全部
 // 卡死，优雅停机永不返回），started 又已置位（再次 Start 只会静默 no-op），
 // 注释承诺的「修好字段还能再次 Start」两条都不成立。
 func (p *Pool) Start(ctx context.Context) {
@@ -204,12 +205,12 @@ func (p *Pool) Start(ctx context.Context) {
 	defer p.mu.Unlock()
 	if p.started {
 		// 二次 Start 静默 no-op 是文档化契约——留观测面供误重启排查
-		//（第九轮审计速赢：Stop 后 Start 同样落此分支，reason 区分形态）
+		//（第九轮审计速赢：Close 后 Start 同样落此分支，reason 区分形态）
 		p.logger().Warn("agentkit.worker.start_ignored", "reason", "already_started")
 		return
 	}
 	if p.stopped {
-		// Stop 后 Start：单次生命周期契约（字段不重置、旧 goroutine 已收）——
+		// Close 后 Start：单次生命周期契约（字段不重置、旧 goroutine 已收）——
 		// 需要重启应构造新 Pool（工厂语义，v2 若开）
 		p.logger().Warn("agentkit.worker.start_ignored", "reason", "stopped_pool_not_restartable")
 		return
@@ -263,7 +264,7 @@ func (p *Pool) Start(ctx context.Context) {
 	})
 	// 心跳循环收编 concurrency/loop（ctx 感知 + 忙时丢 tick + 单轮 panic 收编
 	// + 停机排水）；FirstDelay 对齐旧 ticker 节拍（首跑在首个 interval 后）。
-	// 心跳独立等待：Stop 在任务排空后才停心跳（在途任务的心跳不能先死），
+	// 心跳独立等待：Close 在任务排空后才停心跳（在途任务的心跳不能先死），
 	// 故不与 worker 同 wg——done 关闭不依赖心跳退出
 	hbLoop := loop.Run(p.hbCtx, loop.Config{
 		Interval:   hbInterval,
@@ -399,34 +400,48 @@ func (p *Pool) guardedCall(panicLog, failLog string, fn func(ctx context.Context
 	return err
 }
 
-// Stop 两阶段停机：取消领取循环 → 等 grace（排空期间心跳继续续期）→ 硬取消执行 →
-// 停心跳。幂等。未启动时调用为 no-op（不消耗停机状态——Stop 在 Start 之前
-// 误调用后，真正的 Stop 依然有效）。
-func (p *Pool) Stop(grace time.Duration) {
+// ErrWorkersStuck Close 硬取消后仍有 worker 未在 hardExitTimeout 内退出
+// （Run 不理会 ctx 的最终形态）。Close 返回包裹它的 error，调用方 errors.Is
+// 判定后应按「goroutine 泄漏」处置——本 Pool 无法再等，goroutine 仍在运行。
+var ErrWorkersStuck = errors.New("worker: 硬取消后仍有 worker 未退出")
+
+// Close 两阶段停机：取消领取循环 → 等 ctx（排空期间心跳继续续期）→ ctx 结束
+// （deadline 到期或调用方取消）后硬取消在途执行 → 停心跳。幂等。未启动时调用
+// 为 no-op 返回 nil（不消耗停机状态——Close 在 Start 之前误调用后，真正的
+// Close 依然有效）。
+//
+// 排空时限经 ctx 编码（context.WithTimeout）；ctx 无 deadline 时排空窗口不设
+// 上限。返回值是首次有效调用的结果（重复调用返回同一结果，不重跑停机）：
+// 干净停机 nil；硬取消后 worker 未在 hardExitTimeout 内退出返回包裹
+// [ErrWorkersStuck] 的 error——泄漏的 goroutine 没有救回来的路径，留痕之外
+// 再把结果交给调用方，让「停机不干净」成为返回值而不是一条日志。
+func (p *Pool) Close(ctx context.Context) error {
 	p.mu.Lock()
 	if !p.started {
 		p.mu.Unlock()
-		return
+		return nil
 	}
 	cancelLoop, cancelRun, cancelHB, done, hbDone, log, workers :=
 		p.cancelLoop, p.cancelRun, p.cancelHB, p.done, p.hbDone, p.logger(), p.N
 	p.mu.Unlock()
 
-	p.stopOnce.Do(func() {
+	p.closeOnce.Do(func() {
 		cancelLoop()
 		select {
 		case <-done:
-		case <-time.After(grace):
-			log.Warn("agentkit.worker.stop_grace_exceeded",
-				"grace", grace.String(), "action", "硬取消在途任务")
+		case <-ctx.Done():
+			log.Warn("agentkit.worker.stop_drain_deadline",
+				"action", "排空时限已到，硬取消在途任务")
 			cancelRun()
 			select {
 			case <-done:
 			case <-time.After(hardExitTimeout):
 				// 静默遗弃是这里最坏的选项：worker 卡在不理会 ctx 的 Run 里，
-				// Stop 却照样置 stopped 并打 Info，运维读到的是「干净停机」。
-				// 状态位仍置（Pool 单次生命周期，stopOnce 已消耗——泄漏的
-				// goroutine 没有救回来的路径），所以留痕是唯一诚实的做法。
+				// Close 却照样置 stopped 并打 Info，运维读到的是「干净停机」。
+				// 状态位仍置（Pool 单次生命周期，closeOnce 已消耗——泄漏的
+				// goroutine 没有救回来的路径），所以留痕+返回值是唯一诚实的做法。
+				p.closeErr = fmt.Errorf("%w: %d/%d workers 未退出（Run 不理会 ctx？），本 Pool 已标记 stopped，这些 goroutine 仍在运行",
+					ErrWorkersStuck, p.liveWorkers.Load(), workers)
 				log.Warn("agentkit.worker.stop_exit_timeout",
 					"stuck_workers", p.liveWorkers.Load(),
 					"workers", workers,
@@ -449,6 +464,7 @@ func (p *Pool) Stop(grace time.Duration) {
 		p.mu.Unlock()
 		log.Info("agentkit.worker.stopped")
 	})
+	return p.closeErr
 }
 
 func (p *Pool) loop(loopCtx, runCtx context.Context, id int) {

@@ -41,7 +41,7 @@ type LeaseStore interface {
 ```go
 NewLeaderElector(store, key, holder, ttl, interval,
     worker.WithOnGained(func() { /* 首次当选与失而复得均触发 */ }),
-    worker.WithOnLost(func()  { /* 续约失败触发；Stop 主动让位不触发 */ }),
+    worker.WithOnLost(func()  { /* 续约失败触发；Close 主动让位不触发 */ }),
 )
 ```
 

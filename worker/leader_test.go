@@ -49,7 +49,7 @@ func (m *memLeaseStore) Release(_ context.Context, key, holder string) error {
 func TestLeaderElectorGainedAndHandover(t *testing.T) {
 	store := newMemLeaseStore()
 	// 回调由独立调度 goroutine 执行（queue#41），故计数必须原子读——
-	// 断言点仍在 Stop / done 之后，那里回调已排空。
+	// 断言点仍在 Close / done 之后，那里回调已排空。
 	var gainedA, lostA atomic.Int32
 	a := NewLeaderElector(store, "poller", "A", 200*time.Millisecond, 50*time.Millisecond,
 		WithOnGained(func() { gainedA.Add(1) }), WithOnLost(func() { lostA.Add(1) }),
@@ -69,14 +69,14 @@ func TestLeaderElectorGainedAndHandover(t *testing.T) {
 	b := NewLeaderElector(store, "poller", "B", 200*time.Millisecond, 20*time.Millisecond,
 		WithLeaderLogger(logx.NewSlogLogger("test")))
 	b.Start(ctx)
-	defer b.Stop()
+	defer b.Close(context.Background())
 	time.Sleep(150 * time.Millisecond)
 	if b.IsLeader() || !a.IsLeader() {
 		t.Fatalf("租约在途 B 不得当选: a=%v b=%v", a.IsLeader(), b.IsLeader())
 	}
 
 	// A 停止让位 → B 应当选
-	a.Stop()
+	a.Close(context.Background())
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && !b.IsLeader() {
 		time.Sleep(10 * time.Millisecond)
@@ -99,7 +99,7 @@ func TestLeaderElectorExpiryHandover(t *testing.T) {
 		WithLeaderLogger(logx.NewSlogLogger("test")))
 	ctx := context.Background()
 	a.Start(ctx)
-	defer a.Stop()
+	defer a.Close(context.Background())
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && !a.IsLeader() {
 		time.Sleep(5 * time.Millisecond)
@@ -113,7 +113,7 @@ func TestLeaderElectorExpiryHandover(t *testing.T) {
 	b := NewLeaderElector(store, "poller", "B", time.Minute, 10*time.Millisecond,
 		WithLeaderLogger(logx.NewSlogLogger("test")))
 	b.Start(ctx)
-	defer b.Stop()
+	defer b.Close(context.Background())
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && !b.IsLeader() {
 		time.Sleep(5 * time.Millisecond)
@@ -124,7 +124,7 @@ func TestLeaderElectorExpiryHandover(t *testing.T) {
 }
 
 // gatedLeaseStore 首次 TryAcquire 阻塞到 gate 关闭（模拟秒级存储调用，
-// 制造"Stop 与在途 tick 穿插"窗口）。
+// 制造"Close 与在途 tick 穿插"窗口）。
 type gatedLeaseStore struct {
 	memLeaseStore
 	gate  chan struct{}
@@ -139,8 +139,8 @@ func (s *gatedLeaseStore) TryAcquire(ctx context.Context, key, holder string, tt
 }
 
 func TestLeaderElectorStopWithInflightTick(t *testing.T) {
-	// Stop 到达时首次 tick 在途：在途 acquire 完成后不得宣布当选（onGained 不触发），
-	// 刚获得的租约必须立即让出；Stop 返回后 IsLeader=false 且存储中无本持有者租约。
+	// Close 到达时首次 tick 在途：在途 acquire 完成后不得宣布当选（onGained 不触发），
+	// 刚获得的租约必须立即让出；Close 返回后 IsLeader=false 且存储中无本持有者租约。
 	store := &gatedLeaseStore{memLeaseStore: *newMemLeaseStore(), gate: make(chan struct{})}
 	store.first.Store(true) // 首次 TryAcquire 阻塞在 gate
 	var gained atomic.Int32
@@ -150,8 +150,8 @@ func TestLeaderElectorStopWithInflightTick(t *testing.T) {
 	time.Sleep(50 * time.Millisecond) // 等竞选 goroutine 阻塞在首次 TryAcquire 的 gate 上
 
 	// 先确保 stop 已关闭，再放行在途 tick：acquire 将在 stopping 状态下返回成功。
-	// 同包白盒：close(e.stop) 等价于 Stop() 的第一步；随后等 e.done 即
-	// Stop() 的等待段（close+wait 分开写以绕开 stopOnce 重复 close）
+	// 同包白盒：close(e.stop) 等价于 Close 的第一步；随后等 e.done 即
+	// Close 的等待段（close+wait 分开写以绕开 stopOnce 重复 close）
 	close(e.stop)
 	close(store.gate)
 	select {
@@ -174,8 +174,8 @@ func TestLeaderElectorStopWithInflightTick(t *testing.T) {
 }
 
 // TestLeaderElectorStopBoundedWhenAcquireHangs 回归（v0.10.28 审计）：TryAcquire
-// 挂起（存储层故障/网络分区且 driver 无超时）时 Stop 不得永久阻塞——tick 的
-// acquire 现带 5s 独立限时，挂起场景下 Stop 有界返回。
+// 挂起（存储层故障/网络分区且 driver 无超时）时 Close 不得永久阻塞——tick 的
+// acquire 现带 5s 独立限时，挂起场景下 Close 有界返回。
 type hangingStore struct {
 	memLeaseStore
 	hang chan struct{}
@@ -199,12 +199,12 @@ func TestLeaderElectorStopBoundedWhenAcquireHangs(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		e.Stop()
+		e.Close(context.Background())
 		close(done)
 	}()
 	select {
 	case <-done:
-		// Stop 有界返回（acquire 限时 5s < 本测试等待预算）
+		// Close 有界返回（acquire 限时 5s < 本测试等待预算）
 	case <-time.After(8 * time.Second):
 		t.Fatal("TryAcquire 挂起时 Stop 应有界返回（acquire 独立限时）")
 	}
@@ -253,11 +253,11 @@ func TestNewLeaderElectorRejectsInvalidParams(t *testing.T) {
 			_ = NewLeaderElector(store, c.key, c.holder, c.ttl, c.interval)
 		}()
 	}
-	// 合法参数构造成功且 Start/Stop 正常（构造期校验不误伤）
+	// 合法参数构造成功且 Start/Close 正常（构造期校验不误伤）
 	e := NewLeaderElector(store, "k", "h1", time.Second, 100*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	e.Start(ctx)
-	e.Stop()
+	e.Close(context.Background())
 	cancel()
 }
 
@@ -292,6 +292,6 @@ func TestTTLIntervalRelationBoundary(t *testing.T) {
 	e := NewLeaderElector(store, "k", "h1", time.Second, 999*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	e.Start(ctx)
-	e.Stop()
+	e.Close(context.Background())
 	cancel()
 }

@@ -82,7 +82,7 @@ func TestPoolClaimsAndRuns(t *testing.T) {
 	}
 
 	cancel()
-	p.Stop(time.Second)
+	p.Close(stopCtx(t, time.Second))
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -125,7 +125,7 @@ func TestPoolMultipleWorkers(t *testing.T) {
 	}
 
 	cancel()
-	p.Stop(time.Second)
+	p.Close(stopCtx(t, time.Second))
 }
 
 func TestPoolStopGraceful(t *testing.T) {
@@ -153,7 +153,7 @@ func TestPoolStopGraceful(t *testing.T) {
 
 	<-started
 	// 短 grace：不应取消（任务自然完成前 grace 到期）
-	p.Stop(10 * time.Millisecond)
+	p.Close(stopCtx(t, 10 * time.Millisecond))
 
 	// 硬取消后任务应收到 ctx 取消
 	time.Sleep(100 * time.Millisecond)
@@ -180,7 +180,7 @@ func TestPoolEmptyQueue(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond) // 空转一段时间
 	cancel()
-	p.Stop(time.Second)
+	p.Close(stopCtx(t, time.Second))
 
 	if count.Load() != 0 {
 		t.Fatal("空队列不应执行任何任务")
@@ -198,13 +198,13 @@ func TestPoolZeroWorkersDefaults(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	p.Start(ctx)
 	cancel()
-	p.Stop(time.Second)
+	p.Close(stopCtx(t, time.Second))
 	// 不应 panic
 }
 
 func TestStopBeforeStartDoesNotBurnShutdown(t *testing.T) {
-	// 回归：先 Stop（未启动）后 Start，真正的 Stop 必须仍然有效
-	//（此前 sync.Once 被 Stop-before-Start 烧穿，之后停机永远失效）
+	// 回归：先 Close（未启动）后 Start，真正的 Close 必须仍然有效
+	//（此前 sync.Once 被 Close-before-Start 烧穿，之后停机永远失效）
 	q := newMockQueue("t1")
 	var ran atomic.Int32
 	p := &Pool{Queue: q, N: 1, Log: logx.NewSlogLogger("test"),
@@ -213,7 +213,7 @@ func TestStopBeforeStartDoesNotBurnShutdown(t *testing.T) {
 			return nil
 		}}
 
-	p.Stop(time.Second) // 未启动时误调用
+	p.Close(stopCtx(t, time.Second)) // 未启动时误调用
 	ctx, cancel := context.WithCancel(context.Background())
 	p.Start(ctx)
 	defer cancel()
@@ -226,7 +226,7 @@ func TestStopBeforeStartDoesNotBurnShutdown(t *testing.T) {
 		t.Fatal("任务应被执行")
 	}
 
-	p.Stop(2 * time.Second) // 真正的停机
+	p.Close(stopCtx(t, 2 * time.Second)) // 真正的停机
 	select {
 	case <-p.done:
 	case <-time.After(3 * time.Second):
@@ -263,7 +263,7 @@ func TestTaskPanicDoesNotKillWorker(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	cancel()
-	p.Stop(2 * time.Second)
+	p.Close(stopCtx(t, 2 * time.Second))
 
 	mu.Lock()
 	defer mu.Unlock()
