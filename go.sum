@@ -14,8 +14,8 @@ github.com/oekit/concurrency v0.40.0 h1:gFwginpsVXdY4R/hzwicyBa2u1WHmCN1h5Bw6ztl
 github.com/oekit/concurrency v0.40.0/go.mod h1:nnPMxDuUq8H9ZrqhsRpGY2n1FMAL0Jio2MZRPKlPeJo=
 github.com/oekit/logx v0.12.1 h1:7vYBKiImDcCDqEXwl8BrQSp29MvFSBUOWFTPm33fw8s=
 github.com/oekit/logx v0.12.1/go.mod h1:aIxiaegg9jzyvXhGXNcjq7ljAdVC2ERUCHqGN+thui0=
-github.com/oekit/pkg v0.57.1 h1:vGZ8srvFMk7+73nlMbdylexCmvm1o7wlU6Gx9HqQ7Yo=
-github.com/oekit/pkg v0.57.1/go.mod h1:Cr6sJpBX2a0gAIgLa32+NY69h/UZtuN6L1ZdXtP9upo=
+github.com/oekit/pkg v0.58.0 h1:nDTPKWh7f3DWghOlIOcGXmvqEQvNNlOblr0HWt8sQO0=
+github.com/oekit/pkg v0.58.0/go.mod h1:Cr6sJpBX2a0gAIgLa32+NY69h/UZtuN6L1ZdXtP9upo=
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94icq4NjY3clb7Lk8O1qJ8BdBEF8z0ibU0rE=
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
 golang.org/x/mod v0.16.0 h1:QX4fJ0Rr5cPQCF7O9lh9Se4pmwfwskqZfq5moyldzic=
