@@ -2,7 +2,37 @@
 
 > 本文件由 `matrix-tools/scripts/gen_changelogs.py` 从 git 历史生成，按 tag 切段、取每段内的 conventional commit 渲染。
 
-## [v0.13.0] — 2026-11-22
+## [v0.13.0] — 2026-11-23
+
+### 重构(worker)：Pool.Stop/LeaderElector.Stop 统一 Close(ctx) error 生命周期契约
+
+* refactor(worker): Pool.Stop(grace)/LeaderElector.Stop 统一为 Close(ctx) error 生命周期契约
+oekit 生态的 Close 契约是 Close(ctx) error + 幂等（bootstrap Component 面同型）。
+Pool.Stop(grace time.Duration) 与 LeaderElector.Stop() 把「限时收口」编码成
+duration/无参形态，与矩阵协议分裂；宿主接线（AddResource 收口钩子）需各自适配。
+- Pool.Close(ctx) error：排空时限经 ctx 编码（WithTimeout）；硬取消后 worker
+  未退出返回包裹新哨兵 ErrWorkersStuck 的 error——「停机不干净」从一条日志
+  升级为返回值；重复调用返回首次有效停机的记录结果（closeOnce+closeErr）。
+- LeaderElector.Close(ctx) error：ctx 先期取消返回 ctx.Err()，让位动作仍在
+  后台完成（文档写明 IsLeader 短暂窗口）；未启动 no-op 语义不变（queue#37）。
+- 日志键 stop_grace_exceeded → stop_drain_deadline（grace 概念被 ctx 取代）；
+  stop_exit_timeout/stop_heartbeat_timeout 键与字段断言保持不变。
+- bianque run_services.go 的 elector.Stop() 接线点迁移为 elector.Close(ctx)。
+* fix(lint): 测试面 Close 返回值显式收编（errcheck，CI 2.14 口径）
+
+- 杂务(deps)：依赖地板追到最新——github.com/oekit/pkg v0.60.0
+
+| 依赖 | 现地板 | 抬到 |
+|---|---|---|
+| `github.com/oekit/pkg` | `v0.59.0` | `v0.60.0` |
+## 为什么
+矩阵的**发版时刻地板时效**门禁（`verify_tag_floor --ref HEAD`）要求：各仓 HEAD
+（= 下次发版会发出去的内容）的依赖地板，相对那一刻的依赖最新版本，不能已落后。
+oekit 基座与矩阵模块都在高频发版 ⇒ 地板是**跑步机**，落后一格就会判红。
+## 兼容性实测
+本工具在提交前跑完 `go build` / `go vet` / `go test -race -count=1 ./...`（全绿才提交）
+与 `go mod tidy -diff`（无漂移）⇒ 改动**只影响依赖版本**，零行为差异。
+只改 `go.mod` / `go.sum` ⇒ 不需要 CHANGELOG 条目（版本段由下次发版的 `prewrite` 生成）。
 
 - 杂务(deps)：依赖地板追到最新——github.com/oekit/pkg v0.59.0
 
@@ -165,6 +195,26 @@ oekit 基座与矩阵模块都在高频发版 ⇒ 地板是**跑步机**，落�
 与 `go mod tidy -diff`（无漂移）⇒ 改动**只影响依赖版本**，零行为差异。
 只改 `go.mod` / `go.sum` ⇒ 不需要 CHANGELOG 条目（版本段由下次发版的 `prewrite` 生成）。
 
+
+- CI：tag push 也触发门禁（与 oekit 侧同口径）
+
+各仓 CI 薄调用层此前只监听 main push / PR / manual ⇒ 打 tag 不触发 CI：
+tag 那一刻没有独立证据（tag 受保护、不可重打，而「tag 后才暴露的错」一个都跑不到）。
+本 PR 只加一行：on.push 下加 tags: ['v*']，让 tag 推送也跑共享 workflow
+（Lint / Test / CHANGELOG coverage / Receipts / 矩阵登记检查），
+与 oekit 侧的薄调用层同口径。
+关联：oagentkit/.github 的 tag 面接线。
+
+
+- 文档(changelog)：预写 v0.13.0 待发版段 + 地板随迁 pkg v0.60.0
+
+* docs(changelog): 预写 v0.13.0 待发版段
+由 release.py prewrite 生成。
+本提交**只**改 CHANGELOG.md——混入别的文件会被 squash 合成一个提交，
+生成器按「实际改了哪些文件」剔除零信息量提交的判据就会失效。
+* chore: 依赖地板随迁 oekit/pkg v0.60.0
+
+- 文档(AGENTS)：错误协议宣告对齐实际（stdlib 同型 sentinel；BizError 限 HTTP 宿主，本 org 库层不用）
 
 ## [v0.12.0] — 2026-11-14
 
