@@ -28,7 +28,7 @@ func TestLeaderElectorStartAfterStopBeforeStart(t *testing.T) {
 		WithLeaderLogger(logx.NewSlogLogger("test")))
 
 	// 误调用：此时从未 Start。
-	e.Close(context.Background())
+	_ = e.Close(context.Background())
 
 	e.Start(context.Background())
 
@@ -43,7 +43,7 @@ func TestLeaderElectorStartAfterStopBeforeStart(t *testing.T) {
 	}
 
 	// 之后真正的 Close 依然有效：等到退出且租约已让出。
-	e.Close(context.Background())
+	_ = e.Close(context.Background())
 	if e.IsLeader() {
 		t.Fatal("Stop 后 IsLeader 应为 false")
 	}
@@ -71,10 +71,10 @@ func TestLeaderElectorStopIdempotentAfterStart(t *testing.T) {
 		t.Fatal("超时：未当选")
 	}
 
-	e.Close(context.Background())
+	_ = e.Close(context.Background())
 	done := make(chan struct{})
 	go func() {
-		e.Close(context.Background())
+		_ = e.Close(context.Background())
 		close(done)
 	}()
 	select {

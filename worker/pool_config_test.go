@@ -61,7 +61,7 @@ func TestPoolStaleAfterFieldReachesReset(t *testing.T) {
 	}
 	p.Start(context.Background())
 	time.Sleep(200 * time.Millisecond)
-	p.Close(stopCtx(t, 2 * time.Second))
+	_ = p.Close(stopCtx(t, 2*time.Second))
 
 	got := q.snapshot()
 	if len(got) == 0 {
@@ -86,7 +86,7 @@ func TestPoolHeartbeatIntervalFieldDrivesLoop(t *testing.T) {
 	}
 	p.Start(context.Background())
 	time.Sleep(200 * time.Millisecond)
-	p.Close(stopCtx(t, 2 * time.Second))
+	_ = p.Close(stopCtx(t, 2*time.Second))
 
 	if got := q.heartbeatCalls.Load(); got < 2 {
 		t.Fatalf("HeartbeatInterval=5ms 时 200ms 内应有多轮心跳，实得 %d——字段未驱动循环", got)
@@ -166,7 +166,7 @@ func TestPoolAcceptsPairedHeartbeatStale(t *testing.T) {
 		StaleAfter:        50 * time.Millisecond, // 恰 10×，≥5× 放行
 	}
 	p.Start(context.Background())
-	p.Close(stopCtx(t, 2 * time.Second))
+	_ = p.Close(stopCtx(t, 2*time.Second))
 	if _, ok := h.find("started"); !ok {
 		t.Fatalf("成对配置应正常启动，实际日志: %v", h.messages())
 	}
@@ -178,7 +178,7 @@ func TestPoolAcceptsPairedHeartbeatStale(t *testing.T) {
 		N:     1,
 	}
 	p2.Start(context.Background())
-	p2.Close(stopCtx(t, 2 * time.Second))
+	_ = p2.Close(stopCtx(t, 2*time.Second))
 }
 
 // TestDefaultRatioMeetsDocRecommendation 缺省比值必须满足文档自定的量化建议

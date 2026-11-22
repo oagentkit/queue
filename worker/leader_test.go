@@ -69,14 +69,14 @@ func TestLeaderElectorGainedAndHandover(t *testing.T) {
 	b := NewLeaderElector(store, "poller", "B", 200*time.Millisecond, 20*time.Millisecond,
 		WithLeaderLogger(logx.NewSlogLogger("test")))
 	b.Start(ctx)
-	defer b.Close(context.Background())
+	defer func() { _ = b.Close(context.Background()) }()
 	time.Sleep(150 * time.Millisecond)
 	if b.IsLeader() || !a.IsLeader() {
 		t.Fatalf("租约在途 B 不得当选: a=%v b=%v", a.IsLeader(), b.IsLeader())
 	}
 
 	// A 停止让位 → B 应当选
-	a.Close(context.Background())
+	_ = a.Close(context.Background())
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && !b.IsLeader() {
 		time.Sleep(10 * time.Millisecond)
@@ -99,7 +99,7 @@ func TestLeaderElectorExpiryHandover(t *testing.T) {
 		WithLeaderLogger(logx.NewSlogLogger("test")))
 	ctx := context.Background()
 	a.Start(ctx)
-	defer a.Close(context.Background())
+	defer func() { _ = a.Close(context.Background()) }()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && !a.IsLeader() {
 		time.Sleep(5 * time.Millisecond)
@@ -113,7 +113,7 @@ func TestLeaderElectorExpiryHandover(t *testing.T) {
 	b := NewLeaderElector(store, "poller", "B", time.Minute, 10*time.Millisecond,
 		WithLeaderLogger(logx.NewSlogLogger("test")))
 	b.Start(ctx)
-	defer b.Close(context.Background())
+	defer func() { _ = b.Close(context.Background()) }()
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && !b.IsLeader() {
 		time.Sleep(5 * time.Millisecond)
@@ -199,7 +199,7 @@ func TestLeaderElectorStopBoundedWhenAcquireHangs(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		e.Close(context.Background())
+		_ = e.Close(context.Background())
 		close(done)
 	}()
 	select {
@@ -257,7 +257,7 @@ func TestNewLeaderElectorRejectsInvalidParams(t *testing.T) {
 	e := NewLeaderElector(store, "k", "h1", time.Second, 100*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	e.Start(ctx)
-	e.Close(context.Background())
+	_ = e.Close(context.Background())
 	cancel()
 }
 
@@ -292,6 +292,6 @@ func TestTTLIntervalRelationBoundary(t *testing.T) {
 	e := NewLeaderElector(store, "k", "h1", time.Second, 999*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	e.Start(ctx)
-	e.Close(context.Background())
+	_ = e.Close(context.Background())
 	cancel()
 }

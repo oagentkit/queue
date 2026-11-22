@@ -53,7 +53,7 @@ func TestLeaderElectorRestartAfterStop(t *testing.T) {
 
 	e.Start(ctx)
 	waitLeader(t, e, 2*time.Second)
-	e.Close(context.Background())
+	_ = e.Close(context.Background())
 	if e.IsLeader() {
 		t.Fatal("Stop 后 IsLeader 应为 false")
 	}
@@ -78,7 +78,7 @@ func TestLeaderElectorRestartAfterStop(t *testing.T) {
 	}
 
 	// 重启后的停机依然有效：租约让出、IsLeader 归 false。
-	e.Close(context.Background())
+	_ = e.Close(context.Background())
 	if e.IsLeader() {
 		t.Fatal("重启后再 Stop，IsLeader 应为 false")
 	}
@@ -102,7 +102,7 @@ func TestLeaderElectorRestartCycle(t *testing.T) {
 	for round := 1; round <= 5; round++ {
 		e.Start(ctx)
 		waitLeader(t, e, 2*time.Second)
-		e.Close(context.Background())
+		_ = e.Close(context.Background())
 		if e.IsLeader() {
 			t.Fatalf("第 %d 轮：Stop 后 IsLeader 应为 false", round)
 		}
@@ -136,7 +136,7 @@ func TestLeaderElectorRestartAfterContextCancel(t *testing.T) {
 	if store.acquires.Load() <= before {
 		t.Fatal("ctx 取消退出后再 Start 未重新参选（startOnce 被首次 Start 消耗）")
 	}
-	e.Close(context.Background())
+	_ = e.Close(context.Background())
 }
 
 // TestLeaderElectorConcurrentStartSingleCampaign 并发重复 Start：只允许一个
@@ -157,7 +157,7 @@ func TestLeaderElectorConcurrentStartSingleCampaign(t *testing.T) {
 	wg.Wait()
 
 	waitLeader(t, e, 2*time.Second)
-	e.Close(context.Background())
+	_ = e.Close(context.Background())
 	if e.IsLeader() {
 		t.Fatal("并发 Start 后 Stop，IsLeader 应为 false")
 	}

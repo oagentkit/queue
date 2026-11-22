@@ -47,7 +47,7 @@ func TestPoolStartPanicLeavesPoolUsable(t *testing.T) {
 	//（优雅停机被无限阻塞，配置错误退化成进程僵死）。
 	stopped := make(chan struct{})
 	go func() {
-		p.Close(stopCtx(t, time.Second))
+		_ = p.Close(stopCtx(t, time.Second))
 		close(stopped)
 	}()
 	select {
@@ -86,5 +86,5 @@ func TestPoolStartPanicLeavesPoolUsable(t *testing.T) {
 		t.Fatal("再次 Start 后 worker 未领取任何任务——Start 未真正生效")
 	}
 
-	p.Close(stopCtx(t, 2 * time.Second))
+	_ = p.Close(stopCtx(t, 2*time.Second))
 }

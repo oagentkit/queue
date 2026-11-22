@@ -34,13 +34,13 @@ func TestStopThenStartRestartsImmediately_Issue103(t *testing.T) {
 	if !awaitLeader(e, "单副本应当选") {
 		t.Fatal("单副本应当选")
 	}
-	e.Close(context.Background())
+	_ = e.Close(context.Background())
 	// Close 返回后立即 Start（原竞态窗口：GOMAXPROCS>1 时可现 already_running）。
 	e.Start(ctx)
 	if !awaitLeader(e, "重启后必须重新参选") {
 		t.Fatal("Stop 后立即 Start 的副本必须重新参选（queue#103）")
 	}
-	e.Close(context.Background())
+	_ = e.Close(context.Background())
 }
 
 // TestStopThenStartLoop_Issue103 高频 Close→Start 循环下重启恒生效
@@ -53,11 +53,11 @@ func TestStopThenStartLoop_Issue103(t *testing.T) {
 		if !awaitLeader(e, "当选") {
 			t.Fatalf("第 %d 轮应当选", i)
 		}
-		e.Close(context.Background())
+		_ = e.Close(context.Background())
 		e.Start(ctx)
 		if !awaitLeader(e, "重启参选") {
 			t.Fatalf("第 %d 轮 Stop 后立即 Start 必须重新参选（queue#103）", i)
 		}
-		e.Close(context.Background())
+		_ = e.Close(context.Background())
 	}
 }

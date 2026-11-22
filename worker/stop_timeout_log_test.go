@@ -112,7 +112,7 @@ func TestStopWarnsWhenWorkerIgnoresContext(t *testing.T) {
 
 	p.Start(context.Background())
 	<-started
-	if err := p.Close(stopCtx(t, 20 * time.Millisecond)); !errors.Is(err, ErrWorkersStuck) {
+	if err := p.Close(stopCtx(t, 20*time.Millisecond)); !errors.Is(err, ErrWorkersStuck) {
 		t.Fatalf("硬取消后 worker 未退出，Close 必须返回 ErrWorkersStuck，实为 %v", err)
 	}
 	unblock()
@@ -157,7 +157,7 @@ func TestStopCleanDrainDoesNotWarn(t *testing.T) {
 	}
 	p.Start(context.Background())
 	time.Sleep(50 * time.Millisecond) // 让任务被领走并跑完（唯一需要等的时序）
-	p.Close(stopCtx(t, 2 * time.Second))
+	_ = p.Close(stopCtx(t, 2*time.Second))
 
 	if _, ok := h.find("stop_exit_timeout"); ok {
 		t.Errorf("正常排空不得打 stop_exit_timeout，实际日志: %v", h.messages())
@@ -220,7 +220,7 @@ func TestStopWarnsWhenHeartbeatRoundStuck(t *testing.T) {
 		t.Fatal("超时：心跳轮次应已开始")
 	}
 	// 无在飞任务 ⇒ worker 很快退出 ⇒ 不进 grace_exceeded，直接走到停心跳
-	p.Close(stopCtx(t, 2 * time.Second))
+	_ = p.Close(stopCtx(t, 2*time.Second))
 
 	rec, ok := h.find("stop_heartbeat_timeout")
 	if !ok {

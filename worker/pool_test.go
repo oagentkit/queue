@@ -82,7 +82,7 @@ func TestPoolClaimsAndRuns(t *testing.T) {
 	}
 
 	cancel()
-	p.Close(stopCtx(t, time.Second))
+	_ = p.Close(stopCtx(t, time.Second))
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -125,7 +125,7 @@ func TestPoolMultipleWorkers(t *testing.T) {
 	}
 
 	cancel()
-	p.Close(stopCtx(t, time.Second))
+	_ = p.Close(stopCtx(t, time.Second))
 }
 
 func TestPoolStopGraceful(t *testing.T) {
@@ -153,7 +153,7 @@ func TestPoolStopGraceful(t *testing.T) {
 
 	<-started
 	// 短 grace：不应取消（任务自然完成前 grace 到期）
-	p.Close(stopCtx(t, 10 * time.Millisecond))
+	_ = p.Close(stopCtx(t, 10*time.Millisecond))
 
 	// 硬取消后任务应收到 ctx 取消
 	time.Sleep(100 * time.Millisecond)
@@ -180,7 +180,7 @@ func TestPoolEmptyQueue(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond) // 空转一段时间
 	cancel()
-	p.Close(stopCtx(t, time.Second))
+	_ = p.Close(stopCtx(t, time.Second))
 
 	if count.Load() != 0 {
 		t.Fatal("空队列不应执行任何任务")
@@ -198,7 +198,7 @@ func TestPoolZeroWorkersDefaults(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	p.Start(ctx)
 	cancel()
-	p.Close(stopCtx(t, time.Second))
+	_ = p.Close(stopCtx(t, time.Second))
 	// 不应 panic
 }
 
@@ -213,7 +213,7 @@ func TestStopBeforeStartDoesNotBurnShutdown(t *testing.T) {
 			return nil
 		}}
 
-	p.Close(stopCtx(t, time.Second)) // 未启动时误调用
+	_ = p.Close(stopCtx(t, time.Second)) // 未启动时误调用
 	ctx, cancel := context.WithCancel(context.Background())
 	p.Start(ctx)
 	defer cancel()
@@ -226,7 +226,7 @@ func TestStopBeforeStartDoesNotBurnShutdown(t *testing.T) {
 		t.Fatal("任务应被执行")
 	}
 
-	p.Close(stopCtx(t, 2 * time.Second)) // 真正的停机
+	_ = p.Close(stopCtx(t, 2*time.Second)) // 真正的停机
 	select {
 	case <-p.done:
 	case <-time.After(3 * time.Second):
@@ -263,7 +263,7 @@ func TestTaskPanicDoesNotKillWorker(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	cancel()
-	p.Close(stopCtx(t, 2 * time.Second))
+	_ = p.Close(stopCtx(t, 2*time.Second))
 
 	mu.Lock()
 	defer mu.Unlock()

@@ -57,7 +57,7 @@ func TestSlowCallbackDoesNotStallRenewal(t *testing.T) {
 	}
 
 	close(release)
-	a.Close(context.Background())
+	_ = a.Close(context.Background())
 }
 
 // TestStopWaitsForCallbacksToDrain done 的含义包含「已入队的回调都跑过了」：
@@ -86,7 +86,7 @@ func TestStopWaitsForCallbacksToDrain(t *testing.T) {
 		t.Fatal("超时：未当选")
 	}
 
-	e.Close(context.Background())
+	_ = e.Close(context.Background())
 	if !drained.Load() {
 		t.Fatal("Stop 返回时在飞回调尚未跑完——done 失去了「回调已排空」的含义")
 	}
@@ -141,5 +141,5 @@ func TestCallbackPanicDoesNotKillDispatcher(t *testing.T) {
 	if lost.Load() == 0 {
 		t.Fatal("超时：失主后 onLost 未送达——调度器已被上一次回调的 panic 打死")
 	}
-	e.Close(context.Background())
+	_ = e.Close(context.Background())
 }
