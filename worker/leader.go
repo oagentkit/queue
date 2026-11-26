@@ -2,6 +2,16 @@
 // 通知汇总等）经租约竞争，与 DB 即队列的 worker 池组成完整的横向扩展故事——
 // 任务面靠 ClaimNextPending 原子抢占天然分片，控制面靠租约选主收敛为单份。
 //
+// 与 goagent-kernel/taskboard 的租约分界（kernel#509 裁决，2026-11-26）：
+// 本文件是**队列选主租约**（每 key 单一 leader，holder 内容比对 + UPSERT 铸造，
+// 过期判 DB 时钟，fence 是可选加强），kernel/taskboard 是**编排任务租约**
+// （每任务一租约，token+fence 同一次原子 Claim 铸造，过期判进程内纯谓词
+// LeaseHeld，凭据是 Release/Complete/Renew 的唯一资格）。两者的 fence 递增
+// 规则**同源同义**（续约不变、易主 +1、不回退），差异在作用域与铸造位置；
+// 接口不可互换、依赖方向互禁（矩阵内仓不得依赖 kernel）⇒ 对称声明、不收敛单源。
+// 另：本包任务面（TaskQueue）只有心跳/复位、handler 无 token/fence——第三形态，
+// 不是租约判据。裁决全文见 oagentkit/goagent-kernel#509。
+//
 // 选主语义：任期 = ttl；持有者失联（进程崩溃）后 ≤ttl 自动换主；
 // 优雅停机主动让位（Release）；脑裂窗口 ≤ 一个轮询间隔，调用方组件需容忍
 // 短暂双主（Argus 轮询任务源幂等双查，双跑无害只浪费）。
