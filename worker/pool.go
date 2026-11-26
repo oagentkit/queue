@@ -1,4 +1,13 @@
 // Package worker DB 即队列 worker pool。
+//
+// 与 goagent-kernel/worker.Loop 的分界（kernel#507 裁决，2026-11-26）：
+// 本包是**DB 即队列数据面驱动**（ClaimNextPending 单语句原子抢占，handler
+// 无凭据，安全=心跳存活 + 失联复位重跑），kernel/worker.Loop 是**编排任务
+// 驱动**（Board 多态领取 + DAG + token+fence 凭据租约 + 凭据接管恢复）。
+// 交集只有薄骨架（ctx 轮询节拍、心跳与续期分离、排水次序、panic 隔离），
+// 底座已单源（oekit/concurrency/loop、async）；依赖方向互禁（矩阵内仓不得
+// 依赖 kernel；kernel 不落库）⇒ 各自成文、不抽共享骨架。
+// 裁决全文见 oagentkit/goagent-kernel#507。
 // webhook/API 同步路径只落库（pending）即返回，N 个 worker 从表拉 pending（原子抢占）执行。
 // 心跳续期 + 过期重置 + 两阶段优雅停机。
 package worker
